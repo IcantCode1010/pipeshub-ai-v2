@@ -57,8 +57,8 @@ class PyMuPDFOCRStrategy(OCRStrategy):
                         temp_out.name,
                         language=self.language,
                         output_type="pdf",
-                        force_ocr=True,
-                        optimize=0,
+                        skip_text=True,  # skip pages that already contain searchable text
+                        optimize=1,
                         progress_bar=False,
                         deskew=True,
                         clean=True,

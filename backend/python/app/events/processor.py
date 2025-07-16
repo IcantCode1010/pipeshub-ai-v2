@@ -467,6 +467,10 @@ class Processor:
                     self.logger.error(f"❌ Error extracting metadata: {str(e)}")
                     domain_metadata = None
 
+            # Safety check for metadata
+            if not domain_metadata:
+                domain_metadata = {}
+
             for sheet_idx, sheet_result in enumerate(all_sheets_result, 1):
                 self.logger.info(f"sheet_name: {sheet_result['sheet_name']}")
                 for table in sheet_result["tables"]:
@@ -560,6 +564,10 @@ class Processor:
                 except Exception as e:
                     self.logger.error(f"❌ Error extracting metadata: {str(e)}")
                     domain_metadata = None
+            
+            # Safety check for metadata
+            if not domain_metadata:
+                domain_metadata = {}
 
             # Create sentence data for indexing
             self.logger.debug("📑 Creating semantic sentences")

@@ -104,6 +104,9 @@ class KafkaConsumerManager:
             # Initialize consumer with aiokafka
             self.consumer = AIOKafkaConsumer(
                 "record-events",
+                session_timeout_ms=30_000,      # was default 10_000
+                heartbeat_interval_ms=10_000,   # was default 3_000
+                max_poll_interval_ms=900_000,   # 15 min, generous for OCR
                 **kafka_config
             )
 

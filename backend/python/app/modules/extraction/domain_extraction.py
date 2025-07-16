@@ -32,6 +32,12 @@ from app.config.utils.named_constants.http_status_code_constants import HttpStat
 from app.modules.extraction.prompt_template import prompt
 from app.utils.llm import get_llm
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
+from app.utils.token_counter import count_tokens
+import tiktoken
+
+# Prompt / completion token limits
+MAX_PROMPT = 32_000          # hard prompt limit
+MAX_OUT    = 512             # response budget
 
 # Update the Literal types
 SentimentType = Literal["Positive", "Neutral", "Negative"]
@@ -188,8 +194,13 @@ class DomainExtractor:
         Extract metadata from document content using Azure OpenAI.
         Includes reflection logic to attempt recovery from parsing failures.
         """
-        self.logger.info("🎯 Extracting domain metadata")
-        self.llm = await get_llm(self.logger, self.config_service)
+        self.logger.info("🎯 Extracting domain metadata - CHUNKING VERSION ACTIVE")
+        # Initialise LLM with explicit token limits
+        self.llm = await get_llm(
+            self.logger,
+            self.config_service,
+            max_tokens=MAX_OUT,
+        )
 
         try:
             self.logger.info(f"🎯 Extracting departments for org_id: {org_id}")
@@ -209,97 +220,143 @@ class DomainExtractor:
                 "{department_list}", department_list
             ).replace("{sentiment_list}", sentiment_list)
             self.prompt_template = PromptTemplate.from_template(filled_prompt)
-
-            formatted_prompt = self.prompt_template.format(content=content)
+            
             self.logger.info("🎯 Prompt formatted successfully")
-
-            messages = [HumanMessage(content=formatted_prompt)]
-            # Use retry wrapper for LLM call
-            response = await self._call_llm(messages)
-
-            # Clean the response content
-            response_text = response.content.strip()
-            if response_text.startswith("```json"):
-                response_text = response_text.replace("```json", "", 1)
-            if response_text.endswith("```"):
-                response_text = response_text.rsplit("```", 1)[0]
-            response_text = response_text.strip()
+            
+            # Calculate token overhead from template with error handling
+            try:
+                self.logger.info("🔧 About to initialize tiktoken encoder...")
+                enc = tiktoken.encoding_for_model(self.llm.model_name)
+                self.logger.info(f"🔧 Tiktoken encoder initialized for model: {self.llm.model_name}")
+                
+                self.logger.info("🔧 About to get template...")
+                TEMPLATE = self.prompt_template.template
+                self.logger.info(f"🔧 Template retrieved, length: {len(TEMPLATE)}")
+                
+                self.logger.info("🔧 About to count tokens...")
+                OVERHEAD = count_tokens(TEMPLATE.format(content=""), self.llm.model_name)
+                self.logger.info(f"🔧 Token overhead calculated: {OVERHEAD}")
+                
+                self.logger.info("🔧 About to calculate STEP...")
+                STEP = MAX_PROMPT - MAX_OUT - OVERHEAD  # safe room per chunk
+                self.logger.info(f"🔧 STEP calculated: {STEP}")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error in token overhead calculation: {str(e)}")
+                self.logger.error(f"❌ Model name: {getattr(self.llm, 'model_name', 'UNKNOWN')}")
+                self.logger.error(f"❌ Template type: {type(self.prompt_template)}")
+                # Fallback to safe defaults
+                self.logger.error("❌ Using fallback values - will send entire content as single chunk")
+                enc = None
+                OVERHEAD = 1000  # Conservative estimate
+                STEP = MAX_PROMPT - MAX_OUT - OVERHEAD
+            
+            try:
+                self.logger.info("🔧 About to log template overhead...")
+                self.logger.info(f"🔧 Template overhead: {OVERHEAD} tokens, Step size: {STEP} tokens")
+                self.logger.info("🔧 Template overhead logged successfully")
+            except Exception as e:
+                self.logger.error(f"❌ Error logging template overhead: {str(e)}")
+                try:
+                    self.logger.error(f"OVERHEAD type: {type(OVERHEAD)}, value: {OVERHEAD}")
+                    self.logger.error(f"STEP type: {type(STEP)}, value: {STEP}")
+                except:
+                    self.logger.error("❌ Cannot even log OVERHEAD/STEP values")
 
             try:
-                # Parse the response using the Pydantic parser
-                parsed_response = self.parser.parse(response_text)
+                self.logger.info("📊 About to encode content...")
+                # Chunk content to respect token limits
+                toks = enc.encode(content)
+                content_tokens = len(toks)
+                self.logger.info(f"📊 Content has {content_tokens} tokens, will create {(content_tokens + STEP - 1) // STEP} chunks")
+                
+                self.logger.info("📦 About to create blocks...")
+                blocks = [
+                    enc.decode(toks[i : i + STEP]) for i in range(0, len(toks), STEP)
+                ]
+                
+                self.logger.info(f"📦 Created {len(blocks)} chunks for processing")
+            except Exception as e:
+                self.logger.error(f"❌ Error in chunking logic: {str(e)}")
+                # Fallback to original behavior - send entire content
+                self.logger.error("❌ Falling back to single chunk processing")
+                blocks = [content]
 
-                # Process topics through similarity check
-                # canonical_topics = await self.process_new_topics(parsed_response.topics)
-                # parsed_response.topics = canonical_topics
-
-                return parsed_response
-
-            except Exception as parse_error:
-                self.logger.error(f"❌ Failed to parse response: {str(parse_error)}")
-                self.logger.error(f"Response content: {response_text}")
-
-                # Reflection: attempt to fix the validation issue by providing feedback to the LLM
+            results = []
+            for idx, block in enumerate(blocks, 1):
+                formatted_prompt = self.prompt_template.format(content=block)
+                
+                # Log actual token counts for debugging
+                chunk_tokens = len(enc.encode(block))
+                full_prompt_tokens = len(enc.encode(formatted_prompt))
+                self.logger.info(f"🔍 Chunk {idx} debug: chunk_tokens={chunk_tokens}, full_prompt_tokens={full_prompt_tokens}, STEP={STEP}, OVERHEAD={OVERHEAD}")
+                
+                if full_prompt_tokens > MAX_PROMPT:
+                    self.logger.error(f"❌ Chunk {idx} exceeds MAX_PROMPT! full_prompt_tokens={full_prompt_tokens} > MAX_PROMPT={MAX_PROMPT}")
+                
+                messages = [HumanMessage(content=formatted_prompt)]
                 try:
-                    self.logger.info(
-                        "🔄 Attempting reflection to fix validation issues"
-                    )
-                    reflection_prompt = f"""
-                    The previous response failed validation with the following error:
-                    {str(parse_error)}
+                    resp = await self._call_llm(messages)
+                    results.append(self._parse(resp))
+                except Exception as e:
+                    self.logger.warning("LLM call failed on chunk %d: %s", idx, e)
+                    self.logger.error(f"❌ Failed chunk {idx} had {full_prompt_tokens} tokens (MAX_PROMPT={MAX_PROMPT})")
 
-                    The response was:
-                    {response_text}
-
-                    Please correct your response to match the expected schema.
-                    Ensure all fields are properly formatted and all required fields are present.
-                    Respond only with valid JSON that matches the DocumentClassification schema.
-                    """
-
-                    reflection_messages = [
-                        HumanMessage(content=formatted_prompt),
-                        AIMessage(content=response_text),
-                        HumanMessage(content=reflection_prompt),
-                    ]
-
-                    # Use retry wrapper for reflection LLM call
-                    reflection_response = await self._call_llm(reflection_messages)
-                    reflection_text = reflection_response.content.strip()
-
-                    # Clean the reflection response
-                    if reflection_text.startswith("```json"):
-                        reflection_text = reflection_text.replace("```json", "", 1)
-                    if reflection_text.endswith("```"):
-                        reflection_text = reflection_text.rsplit("```", 1)[0]
-                    reflection_text = reflection_text.strip()
-
-                    self.logger.info(f"🎯 Reflection response: {reflection_text}")
-
-                    # Try parsing again with the reflection response
-                    parsed_reflection = self.parser.parse(reflection_text)
-
-                    # Process topics through similarity check
-                    canonical_topics = await self.process_new_topics(
-                        parsed_reflection.topics
-                    )
-                    parsed_reflection.topics = canonical_topics
-
-                    self.logger.info(
-                        "✅ Reflection successful - validation passed on second attempt"
-                    )
-                    return parsed_reflection
-
-                except Exception as reflection_error:
-                    self.logger.error(
-                        f"❌ Reflection attempt failed: {str(reflection_error)}"
-                    )
-                    raise ValueError(
-                        f"Failed to parse LLM response and reflection attempt failed: {str(parse_error)}"
-                    )
+            return self._merge_chunks(results)
 
         except Exception as e:
             self.logger.error(f"❌ Error during metadata extraction: {str(e)}")
             raise
+
+    def _parse(self, response) -> DocumentClassification:
+        """Parse LLM response into DocumentClassification object"""
+        # Clean the response content
+        response_text = response.content.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text.replace("```json", "", 1)
+        if response_text.endswith("```"):
+            response_text = response_text.rsplit("```", 1)[0]
+        response_text = response_text.strip()
+
+        try:
+            # Parse the response using the Pydantic parser
+            parsed_response = self.parser.parse(response_text)
+            return parsed_response
+        except Exception as parse_error:
+            self.logger.error(f"❌ Failed to parse response: {str(parse_error)}")
+            self.logger.error(f"Response content: {response_text}")
+            # Return a default DocumentClassification on parse failure
+            return DocumentClassification(
+                departments=[],
+                categories="Unknown",
+                subcategories=SubCategories(level1="Unknown", level2="Unknown", level3="Unknown"),
+                languages=["Unknown"],
+                sentiment="Neutral",
+                confidence_score=0.0,
+                topics=[],
+                summary=""
+            )
+
+    def _merge_chunks(self, parts: list[DocumentClassification]) -> DocumentClassification:
+        """Union sets and concatenate summary; simple majority for category."""
+        if not parts:
+            return DocumentClassification(
+                departments=[],
+                categories="Unknown", 
+                subcategories=SubCategories(level1="Unknown", level2="Unknown", level3="Unknown"),
+                languages=["Unknown"],
+                sentiment="Neutral",
+                confidence_score=0.0,
+                topics=[],
+                summary=""
+            )
+        
+        base = parts[0]
+        base.departments = sorted({d for p in parts for d in p.departments})
+        base.languages = sorted({l for p in parts for l in p.languages})
+        base.topics = sorted({t for p in parts for t in p.topics})[:20]
+        base.summary = " ".join(p.summary for p in parts if p.summary)
+        return base
 
     async def save_metadata_to_db(
         self, org_id: str, record_id: str, metadata: DocumentClassification, virtual_record_id: str
