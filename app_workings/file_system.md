@@ -11,7 +11,16 @@ pipeshub-ai/
 ├── backend/                            # Backend services (Node.js + Python)
 ├── frontend/                           # React frontend application
 ├── deployment/                         # Docker deployment configurations
-└── docs/                              # Documentation files
+├── docs/                              # Documentation files
+├── app_workings/                       # Application documentation
+│   └── file_system.md                  # Complete file system structure
+├── extraction-methods/                 # Extraction documentation
+│   └── extraction-method.md            # Enhanced extraction with aviation & confidence
+├── memory-bank/                        # Memory and project documentation
+│   └── projectbrief.md                 # Project overview and requirements
+├── CLAUDE.md                           # Claude Code project instructions
+├── MEMORY.md                           # Development memory and context
+└── standalone-frontend/                # Standalone frontend components
 ```
 
 ---
@@ -166,7 +175,8 @@ backend/python/
     │       ├── chatbot.py            # Chat interface endpoints
     │       ├── health.py             # Health check endpoints
     │       ├── records.py            # Document record endpoints
-    │       └── search.py             # Search endpoints
+    │       ├── search.py             # Search endpoints
+    │       └── confidence_monitoring.py # Confidence monitoring endpoints
     │
     ├── builders/                     # Data builders
     │   ├── __init__.py
@@ -249,9 +259,12 @@ backend/python/
     │   ├── agents/                   # AI agent implementations
     │   │   └── conversational/       # Conversational agents
     │   ├── extraction/               # Metadata extraction
-    │   │   ├── extraction_service.py # Main extraction service
-    │   │   ├── metadata_extractor.py # Metadata extraction logic
-    │   │   ├── prompt_template.py    # Extraction prompts
+    │   │   ├── domain_extraction.py  # Enhanced domain extraction with aviation support
+    │   │   ├── prompt_template.py    # Standard & aviation extraction prompts
+    │   │   ├── confidence_utils.py   # Confidence-based routing & monitoring
+    │   │   ├── test_aviation_extraction.py # Aviation extraction tests
+    │   │   ├── test_confidence_utilization.py # Confidence utilization tests
+    │   │   ├── simple_confidence_test.py # Simple confidence demos
     │   │   └── README.md             # Extraction documentation
     │   ├── indexing/                 # Document indexing
     │   │   ├── indexing_service.py   # Main indexing service
@@ -448,6 +461,9 @@ frontend/
     │   │   ├── motion-viewport.tsx   # Viewport animations
     │   │   ├── variants/             # Animation variants
     │   │   └── types.ts              # Animation types
+    │   ├── confidence/               # Confidence score components
+    │   │   ├── ConfidenceIndicator.tsx # Confidence visualization with aviation support
+    │   │   └── ConfidenceDashboard.tsx # Confidence monitoring dashboard
     │   ├── carousel/                 # Carousel components
     │   │   ├── carousel.tsx          # Main carousel
     │   │   ├── carousel-dots.tsx     # Carousel dots
@@ -836,4 +852,89 @@ Frontend (settings pages)
 All services (config consumption)
 ```
 
-This comprehensive file system structure shows how each component fits into the larger PipesHub AI ecosystem, with clear relationships between frontend components, backend services, and infrastructure elements. The modular architecture enables independent development and deployment while maintaining strong integration points for seamless functionality.
+---
+
+## Recent Enhancements (Aviation & Confidence Score Features)
+
+### Aviation-Specific Extraction System
+
+**Enhanced Files:**
+- `backend/python/app/modules/extraction/domain_extraction.py` - Added aviation-specific models and extraction methods
+- `backend/python/app/modules/extraction/prompt_template.py` - Added aviation prompt with safety-focused metadata
+- `extraction-methods/extraction-method.md` - Updated with aviation extraction documentation
+
+**New Aviation Features:**
+- Aviation-specific departments (Flight Operations, Aircraft Maintenance, Safety & Quality Assurance, etc.)
+- Safety-critical sentiment analysis (Safety Critical, Advisory, Regulatory, etc.)
+- Flight operations metadata (flight phases, procedure types, systems affected)
+- Maintenance metadata (aircraft types, ATA chapters, regulatory references)
+- Enhanced topic extraction for aviation terminology
+
+### Confidence Score Utilization System
+
+**New Files:**
+- `backend/python/app/modules/extraction/confidence_utils.py` - Confidence-based routing and monitoring
+- `backend/python/app/api/confidence_monitoring.py` - API endpoints for confidence monitoring
+- `frontend/src/components/confidence/ConfidenceIndicator.tsx` - Confidence visualization component
+- `frontend/src/components/confidence/ConfidenceDashboard.tsx` - Monitoring dashboard
+- `backend/python/app/modules/extraction/test_*.py` - Test files for confidence and aviation features
+
+**Confidence Features:**
+- Automatic document routing based on confidence bands (HIGH/MEDIUM/LOW)
+- Confidence-based caching with variable TTL (24h/12h/1h)
+- Real-time quality monitoring and alerting
+- Review queue management with priority-based routing
+- Safety-critical document special handling
+- Performance optimization without impacting extraction speed
+
+### Key Enhancement Relationships
+
+#### Aviation Extraction Flow
+```
+Document Upload
+  ↓ Aviation Detection
+Enhanced Prompt (aviation_prompt)
+  ↓ LLM Processing
+Aviation Metadata (flight_ops_metadata, maintenance_metadata)
+  ↓ Safety Validation
+Safety-Critical Routing (if confidence < 80%)
+  ↓ Storage
+ArangoDB (with aviation-specific fields)
+```
+
+#### Confidence Processing Flow
+```
+Extraction Completion
+  ↓ Confidence Analysis
+Confidence Band Calculation (confidence_utils.py)
+  ↓ Routing Decision
+Auto-approve / Review Queue / Urgent Review
+  ↓ Caching Strategy
+Variable TTL based on confidence
+  ↓ Quality Monitoring
+Real-time metrics and alerts
+```
+
+#### Frontend Integration
+```
+Document Display
+  ↓ Confidence Indicator
+ConfidenceIndicator.tsx (with aviation icons)
+  ↓ Dashboard Access
+ConfidenceDashboard.tsx (monitoring interface)
+  ↓ API Communication
+confidence_monitoring.py endpoints
+  ↓ Real-time Updates
+WebSocket/polling for live metrics
+```
+
+### Performance Impact
+
+The confidence score utilization system is designed for **zero performance impact**:
+- **Asynchronous Processing**: Confidence routing happens in background threads
+- **Lightweight Operations**: Simple threshold checks without heavy computation
+- **Smart Caching**: High confidence documents cached 24x longer than low confidence
+- **Graceful Degradation**: System works normally if confidence features are unavailable
+- **Optimized Storage**: Confidence metadata stored efficiently with documents
+
+This comprehensive file system structure shows how each component fits into the larger PipesHub AI ecosystem, with clear relationships between frontend components, backend services, and infrastructure elements. The modular architecture enables independent development and deployment while maintaining strong integration points for seamless functionality. The recent aviation and confidence score enhancements demonstrate the system's extensibility and focus on specialized domain requirements with intelligent quality management.

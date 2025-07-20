@@ -144,13 +144,17 @@ async def authenticate_requests(request: Request, call_next) -> JSONResponse:
         )
 
 
-# Add CORS middleware
+# Add CORS middleware with secure configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",  # Development frontend
+        "http://localhost:3001",  # Alternative dev port
+        "https://your-domain.com",  # Production - update with actual domain
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "x-session-token", "x-api-key"],
 )
 
 

@@ -161,7 +161,7 @@ export function createUserRouter(container: Container) {
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
   const logger = container.get<Logger>('Logger');
   const config = container.get<AppConfig>('AppConfig');
-  // Todo: Apply Rate Limiter Middleware
+  // Rate limiting is now applied globally in app.ts
   // Todo: Apply Validation Middleware
   // Routes
 

@@ -447,7 +447,7 @@ const ChatSidebar = ({
           }}
         >
           {activeTab === 'my'
-            ? 'Start a new conversation to begin chatting with PipesHub Agent'
+            ? 'Start a new conversation to begin chatting with Aerointel Solutions Agent'
             : 'When someone shares a conversation with you, it will appear here'}
         </Typography>
         {activeTab === 'my' && (
@@ -628,7 +628,7 @@ const ChatSidebar = ({
           <Icon icon={menuIcon} />
         </IconButton>
         <Typography variant="h6" sx={{ flex: 1 }}>
-          PipesHub Agent
+          Aerointel Solutions Agent
         </Typography>
         <>
           <Tooltip title="Archived Chats">

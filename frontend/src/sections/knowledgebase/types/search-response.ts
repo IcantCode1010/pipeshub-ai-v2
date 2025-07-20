@@ -56,7 +56,7 @@ export interface AggregatedDocument {
   documents: DocumentContent[];
 }
 
-export namespace PipesHub {
+export namespace Aerointel {
   export interface Record {
     _key: string;
     _id: string;
@@ -95,7 +95,7 @@ export interface SearchResponse {
   searchId: string;
   searchResponse: {
     searchResults: SearchResult[];
-    records: PipesHub.Record[];
+    records: Aerointel.Record[];
   };
 }
 
@@ -112,5 +112,5 @@ export interface KnowledgeSearchProps {
   onSearchQueryChange: (query: string) => void;
   onTopKChange: (callback: (prevTopK: number) => number) => void;
   onViewCitations: (recordId: string, extension: string, recordCitation?: SearchResult) => Promise<void>;
-  recordsMap: Record<string, PipesHub.Record>;
+  recordsMap: Record<string, Aerointel.Record>;
 }

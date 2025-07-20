@@ -1,6 +1,7 @@
 import json
 import uuid
-from typing import List, Literal
+from typing import List, Literal, Optional
+from enum import Enum
 
 import aiohttp
 import jwt
@@ -29,7 +30,8 @@ from app.config.utils.named_constants.arangodb_constants import (
     DepartmentNames,
 )
 from app.config.utils.named_constants.http_status_code_constants import HttpStatusCode
-from app.modules.extraction.prompt_template import prompt
+from app.modules.extraction.prompt_template import prompt, aviation_prompt
+from app.modules.extraction.confidence_utils import route_document_by_confidence, quality_monitor
 from app.utils.llm import get_llm
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from app.utils.token_counter import count_tokens
@@ -39,8 +41,64 @@ import tiktoken
 MAX_PROMPT = 32_000          # hard prompt limit
 MAX_OUT    = 512             # response budget
 
+# Confidence-based processing thresholds
+class ConfidenceBand(Enum):
+    HIGH = "HIGH"      # >= 0.85
+    MEDIUM = "MEDIUM"  # 0.6 - 0.84
+    LOW = "LOW"        # < 0.6
+
+class ConfidenceThresholds:
+    AUTO_APPROVE = 0.85
+    HUMAN_REVIEW = 0.6
+    AUTO_REJECT = 0.3
+    SAFETY_CRITICAL_MIN = 0.8  # Aviation safety documents need higher confidence
+
+# Confidence-based cache TTL (in seconds)
+CONFIDENCE_CACHE_CONFIG = {
+    ConfidenceBand.HIGH: 86400,    # 24 hours for high confidence
+    ConfidenceBand.MEDIUM: 43200,  # 12 hours for medium confidence  
+    ConfidenceBand.LOW: 3600       # 1 hour for low confidence
+}
+
 # Update the Literal types
 SentimentType = Literal["Positive", "Neutral", "Negative"]
+
+# Aviation-specific types
+AviationSentimentType = Literal[
+    "Safety Critical",
+    "Advisory", 
+    "Routine",
+    "Positive",
+    "Negative",
+    "Regulatory"
+]
+
+FlightPhaseType = Literal[
+    "preflight",
+    "pushback",
+    "taxi",
+    "takeoff",
+    "initial_climb",
+    "climb",
+    "cruise",
+    "descent",
+    "approach",
+    "landing",
+    "taxi_in",
+    "shutdown",
+    "turnaround"
+]
+
+ProcedureType = Literal["Normal", "Non-Normal", "Emergency"]
+
+MaintenanceType = Literal[
+    "Scheduled",
+    "Unscheduled",
+    "MEL",
+    "SB",
+    "AD",
+    "Modification"
+]
 
 
 class SubCategories(BaseModel):
@@ -68,6 +126,101 @@ class DocumentClassification(BaseModel):
         description="List of key topics/themes extracted from the document"
     )
     summary: str = Field(description="Summary of the document")
+    confidence_band: Optional[str] = Field(default=None, description="Confidence band: HIGH/MEDIUM/LOW")
+    requires_review: Optional[bool] = Field(default=None, description="Whether document requires human review")
+    cache_ttl: Optional[int] = Field(default=None, description="Cache TTL based on confidence")
+
+
+# Aviation-specific models
+class FlightOperationsMetadata(BaseModel):
+    flight_phase: Optional[List[FlightPhaseType]] = Field(
+        default=None,
+        description="Flight phases covered in the document"
+    )
+    procedure_type: Optional[ProcedureType] = Field(
+        default=None,
+        description="Type of procedure: Normal, Non-Normal, or Emergency"
+    )
+    checklist_section: Optional[str] = Field(
+        default=None,
+        description="Specific checklist name or section"
+    )
+    systems_affected: Optional[List[str]] = Field(
+        default=None,
+        description="Aircraft systems affected or discussed"
+    )
+
+
+class MaintenanceMetadata(BaseModel):
+    aircraft_type: Optional[str] = Field(
+        default=None,
+        description="ICAO aircraft type code (e.g., B737, A320)"
+    )
+    ata_chapter: Optional[str] = Field(
+        default=None,
+        description="ATA chapter number for the system/component"
+    )
+    maintenance_type: Optional[MaintenanceType] = Field(
+        default=None,
+        description="Type of maintenance activity"
+    )
+    regulatory_references: Optional[List[str]] = Field(
+        default=None,
+        description="Applicable ADs, SBs, or other regulatory references"
+    )
+    components_involved: Optional[List[str]] = Field(
+        default=None,
+        description="Specific components or parts involved"
+    )
+    tools_required: Optional[List[str]] = Field(
+        default=None,
+        description="Special tools or equipment required"
+    )
+
+
+class AviationDocumentClassification(BaseModel):
+    departments: List[str] = Field(
+        description="List of aviation departments (1-3)",
+        max_items=3,
+        min_items=1
+    )
+    category: str = Field(
+        description="Either 'Flight Operations' or 'Aircraft Maintenance'"
+    )
+    subcategories: SubCategories = Field(
+        description="Hierarchical aviation subcategories"
+    )
+    languages: List[str] = Field(
+        description="Languages detected in the document"
+    )
+    sentiment: AviationSentimentType = Field(
+        description="Aviation-specific sentiment classification"
+    )
+    confidence_score: float = Field(
+        description="Confidence score of the classification",
+        ge=0.0,
+        le=1.0
+    )
+    topics: List[str] = Field(
+        description="3-6 aviation-specific topics",
+        min_items=3,
+        max_items=6
+    )
+    summary: str = Field(
+        description="Summary focusing on safety and operational impact"
+    )
+    flight_operations_metadata: Optional[FlightOperationsMetadata] = Field(
+        default=None,
+        description="Metadata specific to flight operations documents"
+    )
+    maintenance_metadata: Optional[MaintenanceMetadata] = Field(
+        default=None,
+        description="Metadata specific to maintenance documents"
+    )
+    confidence_band: Optional[str] = Field(default=None, description="Confidence band: HIGH/MEDIUM/LOW")
+    requires_review: Optional[bool] = Field(default=None, description="Whether document requires human review")
+    cache_ttl: Optional[int] = Field(default=None, description="Cache TTL based on confidence")
+    safety_critical_low_confidence: Optional[bool] = Field(default=None, description="Safety doc with low confidence")
 
 
 class DomainExtractor:
@@ -79,6 +232,7 @@ class DomainExtractor:
         self.logger.info("🚀 self.arango_service.db: %s", self.arango_service.db)
 
         self.parser = PydanticOutputParser(pydantic_object=DocumentClassification)
+        self.aviation_parser = PydanticOutputParser(pydantic_object=AviationDocumentClassification)
 
         # Initialize topics storage
         self.topics_store = set()  # Store all accepted topics
@@ -96,6 +250,56 @@ class DomainExtractor:
         self.max_retries = 3
         self.min_wait = 1  # seconds
         self.max_wait = 10  # seconds
+
+    def _calculate_confidence_band(self, confidence_score: float) -> ConfidenceBand:
+        """Calculate confidence band from confidence score"""
+        if confidence_score >= ConfidenceThresholds.AUTO_APPROVE:
+            return ConfidenceBand.HIGH
+        elif confidence_score >= ConfidenceThresholds.HUMAN_REVIEW:
+            return ConfidenceBand.MEDIUM
+        else:
+            return ConfidenceBand.LOW
+
+    def _should_require_review(self, confidence_score: float, is_safety_critical: bool = False) -> bool:
+        """Determine if document requires human review based on confidence"""
+        if is_safety_critical:
+            return confidence_score < ConfidenceThresholds.SAFETY_CRITICAL_MIN
+        return ConfidenceThresholds.HUMAN_REVIEW <= confidence_score < ConfidenceThresholds.AUTO_APPROVE
+
+    def _get_cache_ttl(self, confidence_band: ConfidenceBand) -> int:
+        """Get cache TTL based on confidence band"""
+        return CONFIDENCE_CACHE_CONFIG.get(confidence_band, 3600)  # Default to 1 hour
+
+    def _is_safety_critical_content(self, metadata) -> bool:
+        """Check if content is safety critical based on metadata"""
+        if hasattr(metadata, 'sentiment'):
+            return metadata.sentiment == "Safety Critical"
+        return False
+
+    def _enhance_with_confidence_data(self, metadata, is_aviation: bool = False):
+        """Enhance metadata with confidence-based processing data"""
+        confidence_band = self._calculate_confidence_band(metadata.confidence_score)
+        is_safety_critical = self._is_safety_critical_content(metadata)
+        
+        # Set confidence band
+        metadata.confidence_band = confidence_band.value
+        
+        # Set review requirement
+        metadata.requires_review = self._should_require_review(
+            metadata.confidence_score, 
+            is_safety_critical
+        )
+        
+        # Set cache TTL
+        metadata.cache_ttl = self._get_cache_ttl(confidence_band)
+        
+        # Aviation-specific: flag safety critical docs with low confidence
+        if is_aviation and hasattr(metadata, 'safety_critical_low_confidence'):
+            metadata.safety_critical_low_confidence = (
+                is_safety_critical and confidence_band == ConfidenceBand.LOW
+            )
+        
+        return metadata
 
     @retry(
         stop=stop_after_attempt(3),
@@ -302,7 +506,17 @@ class DomainExtractor:
                     self.logger.warning("LLM call failed on chunk %d: %s", idx, e)
                     self.logger.error(f"❌ Failed chunk {idx} had {full_prompt_tokens} tokens (MAX_PROMPT={MAX_PROMPT})")
 
-            return self._merge_chunks(results)
+            final_result = self._merge_chunks(results)
+            
+            # Enhance with confidence-based data
+            final_result = self._enhance_with_confidence_data(final_result, is_aviation=False)
+            
+            # Log confidence-based routing decision
+            self.logger.info(f"📊 Extraction confidence: {final_result.confidence_score:.3f} ({final_result.confidence_band})")
+            if final_result.requires_review:
+                self.logger.info("🔍 Document flagged for human review")
+                
+            return final_result
 
         except Exception as e:
             self.logger.error(f"❌ Error during metadata extraction: {str(e)}")
@@ -358,6 +572,210 @@ class DomainExtractor:
         base.summary = " ".join(p.summary for p in parts if p.summary)
         return base
 
+    async def extract_aviation_metadata(
+        self, content: str, org_id: str
+    ) -> AviationDocumentClassification:
+        """
+        Extract aviation-specific metadata from document content using Azure OpenAI.
+        """
+        self.logger.info("✈️ Extracting aviation domain metadata")
+        
+        # Initialize LLM with explicit token limits
+        self.llm = await get_llm(
+            self.logger,
+            self.config_service,
+            max_tokens=MAX_OUT,
+        )
+        
+        try:
+            # Aviation departments list
+            aviation_departments = [
+                "Flight Operations",
+                "Aircraft Maintenance",
+                "Air Traffic Control",
+                "Safety & Quality Assurance",
+                "Regulatory Compliance",
+                "Training & Certification",
+                "Ground Operations",
+                "Engineering & Technical Publications",
+                "Flight Dispatch",
+                "Emergency Response"
+            ]
+            
+            # Use aviation prompt template
+            self.prompt_template = PromptTemplate.from_template(aviation_prompt)
+            
+            # Calculate token overhead
+            try:
+                enc = tiktoken.encoding_for_model(self.llm.model_name)
+                TEMPLATE = self.prompt_template.template
+                OVERHEAD = count_tokens(TEMPLATE.format(content=""), self.llm.model_name)
+                STEP = MAX_PROMPT - MAX_OUT - OVERHEAD
+                
+            except Exception as e:
+                self.logger.warning(f"⚠️ Token counting failed: {str(e)}, using fallback")
+                STEP = 25000  # Conservative fallback
+            
+            # Chunk the content if needed
+            chunks = []
+            if len(content) > STEP:
+                self.logger.info(f"📄 Content exceeds token limit, chunking required")
+                for i in range(0, len(content), STEP):
+                    chunks.append(content[i:i + STEP])
+            else:
+                chunks = [content]
+            
+            # Process each chunk
+            all_results = []
+            for i, chunk in enumerate(chunks):
+                self.logger.info(f"🔄 Processing chunk {i+1} of {len(chunks)}")
+                
+                messages = [
+                    HumanMessage(content=self.prompt_template.format(content=chunk))
+                ]
+                
+                try:
+                    response = await self._call_llm(messages)
+                    if response:
+                        parsed = await self._parse_aviation_response(response.content)
+                        if parsed:
+                            all_results.append(parsed)
+                except Exception as e:
+                    self.logger.error(f"❌ Error processing chunk {i+1}: {str(e)}")
+                    continue
+            
+            # Merge results if multiple chunks
+            if len(all_results) > 1:
+                final_result = self._merge_aviation_chunks(all_results)
+            elif all_results:
+                final_result = all_results[0]
+            else:
+                # Return default aviation classification
+                final_result = AviationDocumentClassification(
+                    departments=["Flight Operations"],
+                    category="Flight Operations",
+                    subcategories=SubCategories(level1="Unknown", level2="Unknown", level3=""),
+                    languages=["English"],
+                    sentiment="Routine",
+                    confidence_score=0.0,
+                    topics=["aviation", "operations", "safety"],
+                    summary="Unable to extract metadata",
+                    flight_operations_metadata=None,
+                    maintenance_metadata=None
+                )
+            
+            # Enhance with confidence-based data (aviation-specific)
+            final_result = self._enhance_with_confidence_data(final_result, is_aviation=True)
+            
+            # Log aviation-specific confidence routing
+            self.logger.info(f"✈️ Aviation extraction confidence: {final_result.confidence_score:.3f} ({final_result.confidence_band})")
+            if final_result.requires_review:
+                self.logger.info("🔍 Aviation document flagged for review")
+            if hasattr(final_result, 'safety_critical_low_confidence') and final_result.safety_critical_low_confidence:
+                self.logger.warning("⚠️ SAFETY CRITICAL document with LOW confidence - immediate review required!")
+                
+            return final_result
+                
+        except Exception as e:
+            self.logger.error(f"❌ Aviation metadata extraction failed: {str(e)}")
+            raise
+    
+    async def _parse_aviation_response(self, response_text: str) -> AviationDocumentClassification:
+        """Parse LLM response for aviation metadata"""
+        try:
+            # Clean response
+            cleaned = response_text.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            
+            # Parse JSON
+            data = json.loads(cleaned)
+            
+            # Handle optional metadata fields
+            flight_ops_metadata = None
+            if "flight_operations_metadata" in data and data["flight_operations_metadata"]:
+                flight_ops_metadata = FlightOperationsMetadata(**data["flight_operations_metadata"])
+            
+            maintenance_metadata = None  
+            if "maintenance_metadata" in data and data["maintenance_metadata"]:
+                maintenance_metadata = MaintenanceMetadata(**data["maintenance_metadata"])
+            
+            # Create classification object
+            return AviationDocumentClassification(
+                departments=data["departments"],
+                category=data["category"],
+                subcategories=SubCategories(**data["subcategories"]),
+                languages=data["languages"],
+                sentiment=data["sentiment"],
+                confidence_score=data["confidence_score"],
+                topics=data["topics"],
+                summary=data["summary"],
+                flight_operations_metadata=flight_ops_metadata,
+                maintenance_metadata=maintenance_metadata
+            )
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to parse aviation response: {str(e)}")
+            raise
+    
+    def _merge_aviation_chunks(self, parts: list[AviationDocumentClassification]) -> AviationDocumentClassification:
+        """Merge multiple aviation document classifications"""
+        if not parts:
+            return None
+            
+        base = parts[0]
+        base.departments = sorted({d for p in parts for d in p.departments})[:3]
+        base.languages = sorted({l for p in parts for l in p.languages})
+        base.topics = sorted({t for p in parts for t in p.topics})[:6]
+        base.summary = " ".join(p.summary for p in parts if p.summary)
+        
+        # Merge flight ops metadata if present
+        if any(p.flight_operations_metadata for p in parts):
+            flight_phases = []
+            systems = []
+            for p in parts:
+                if p.flight_operations_metadata:
+                    if p.flight_operations_metadata.flight_phase:
+                        flight_phases.extend(p.flight_operations_metadata.flight_phase)
+                    if p.flight_operations_metadata.systems_affected:
+                        systems.extend(p.flight_operations_metadata.systems_affected)
+            
+            if flight_phases or systems:
+                base.flight_operations_metadata = FlightOperationsMetadata(
+                    flight_phase=list(set(flight_phases)) if flight_phases else None,
+                    systems_affected=list(set(systems)) if systems else None,
+                    procedure_type=base.flight_operations_metadata.procedure_type if base.flight_operations_metadata else None,
+                    checklist_section=base.flight_operations_metadata.checklist_section if base.flight_operations_metadata else None
+                )
+        
+        # Merge maintenance metadata if present  
+        if any(p.maintenance_metadata for p in parts):
+            refs = []
+            components = []
+            tools = []
+            for p in parts:
+                if p.maintenance_metadata:
+                    if p.maintenance_metadata.regulatory_references:
+                        refs.extend(p.maintenance_metadata.regulatory_references)
+                    if p.maintenance_metadata.components_involved:
+                        components.extend(p.maintenance_metadata.components_involved)
+                    if p.maintenance_metadata.tools_required:
+                        tools.extend(p.maintenance_metadata.tools_required)
+            
+            if refs or components or tools:
+                base.maintenance_metadata = MaintenanceMetadata(
+                    aircraft_type=base.maintenance_metadata.aircraft_type if base.maintenance_metadata else None,
+                    ata_chapter=base.maintenance_metadata.ata_chapter if base.maintenance_metadata else None,
+                    maintenance_type=base.maintenance_metadata.maintenance_type if base.maintenance_metadata else None,
+                    regulatory_references=list(set(refs)) if refs else None,
+                    components_involved=list(set(components)) if components else None,
+                    tools_required=list(set(tools)) if tools else None
+                )
+        
+        return base
+
     async def save_metadata_to_db(
         self, org_id: str, record_id: str, metadata: DocumentClassification, virtual_record_id: str
     ) -> dict | None:
@@ -367,6 +785,22 @@ class DomainExtractor:
         self.logger.info("🚀 Saving metadata to ArangoDB")
 
         try:
+            # Route document based on confidence score
+            metadata_dict = metadata.dict() if hasattr(metadata, 'dict') else metadata.__dict__
+            metadata_dict['document_id'] = record_id
+            metadata_dict['org_id'] = org_id
+            
+            routing_decision = await route_document_by_confidence(record_id, metadata_dict)
+            self.logger.info(f"📊 Confidence routing: {routing_decision['processing_path']}")
+            
+            # Add routing information to document
+            doc_updates = {
+                'confidence_score': metadata.confidence_score,
+                'confidence_band': metadata.confidence_band,
+                'requires_review': metadata.requires_review,
+                'processing_path': routing_decision['processing_path'],
+                'cache_ttl': metadata.cache_ttl
+            }
             # Retrieve the document content from ArangoDB
             record = await self.arango_service.get_document(
                 record_id, CollectionNames.RECORDS.value

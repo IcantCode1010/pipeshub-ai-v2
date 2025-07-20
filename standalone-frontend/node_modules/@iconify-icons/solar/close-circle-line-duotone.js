@@ -1,0 +1,6 @@
+const data = {
+	"width": 24,
+	"height": 24,
+	"body": "<g fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><circle cx=\"12\" cy=\"12\" r=\"10\" opacity=\".5\"/><path stroke-linecap=\"round\" d=\"m14.5 9.5l-5 5m0-5l5 5\"/></g>"
+};
+export default data;

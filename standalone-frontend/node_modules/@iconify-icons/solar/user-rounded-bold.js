@@ -1,0 +1,6 @@
+const data = {
+	"width": 24,
+	"height": 24,
+	"body": "<g fill=\"currentColor\"><circle cx=\"12\" cy=\"6\" r=\"4\"/><ellipse cx=\"12\" cy=\"17\" rx=\"7\" ry=\"4\"/></g>"
+};
+export default data;

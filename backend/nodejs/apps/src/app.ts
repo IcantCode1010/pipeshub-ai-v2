@@ -3,6 +3,7 @@ import path from 'path';
 import helmet from 'helmet';
 import cors from 'cors';
 import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
 import http from 'http';
 import { Container } from 'inversify';
 import { TokenManagerContainer } from './modules/tokens_manager/container/token-manager.container';
@@ -244,7 +245,32 @@ export class Application {
         },
       }),
     );
-    // Todo: Apply Rate Limit Middleware
+    
+    // Apply Rate Limit Middleware
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const maxRequests = isDevelopment ? 10000 : 100; // Very high limit for development
+    
+    this.logger.info(`Configuring rate limiter: NODE_ENV=${process.env.NODE_ENV}, max requests=${maxRequests}`);
+    
+    const limiter = rateLimit({
+      windowMs: 15 * 60 * 1000, // 15 minutes
+      max: maxRequests,
+      message: {
+        error: 'Too many requests from this IP, please try again later.',
+        code: 'RATE_LIMIT_EXCEEDED',
+      },
+      standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+      legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+      handler: (req, res) => {
+        this.logger.warn(`Rate limit exceeded for IP: ${req.ip} (max: ${maxRequests})`);
+        res.status(429).json({
+          error: 'Too many requests from this IP, please try again later.',
+          code: 'RATE_LIMIT_EXCEEDED',
+        });
+      },
+    });
+    
+    this.app.use(limiter);
   }
 
   private configureRoutes(): void {

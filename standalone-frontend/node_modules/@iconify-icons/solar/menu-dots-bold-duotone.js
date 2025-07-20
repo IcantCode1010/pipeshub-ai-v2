@@ -1,0 +1,6 @@
+const data = {
+	"width": 24,
+	"height": 24,
+	"body": "<g fill=\"currentColor\"><path d=\"M7 12a2 2 0 1 1-4 0a2 2 0 0 1 4 0Zm14 0a2 2 0 1 1-4 0a2 2 0 0 1 4 0Z\"/><path d=\"M14 12a2 2 0 1 1-4 0a2 2 0 0 1 4 0Z\" opacity=\".5\"/></g>"
+};
+export default data;
