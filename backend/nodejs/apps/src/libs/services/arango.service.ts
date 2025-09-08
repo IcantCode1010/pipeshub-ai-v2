@@ -74,6 +74,10 @@ export class ArangoService {
       process.on('SIGTERM', this.gracefulShutdown.bind(this));
 
       this.isInitialized = true;
+      
+      // Initialize collections after database connection
+      await this.ensureCollections();
+      
       // Set up connection event handlers
       this.setupConnectionHandlers();
       logger.info(`Connected to ArangoDB database: ${databaseName}`);
@@ -175,5 +179,59 @@ export class ArangoService {
 
   public async isConnected(): Promise<boolean> {
     return this.isInitialized && (await this.healthCheck());
+  }
+
+  /**
+   * Ensures all required collections exist in the database.
+   * Creates them if they don't exist.
+   * This prevents the "collection or view not found" errors.
+   */
+  private async ensureCollections(): Promise<void> {
+    if (!this.db) {
+      throw new InternalServerError('Database not initialized');
+    }
+
+    const requiredCollections = [
+      { name: 'records', type: 'document' },
+      { name: 'files', type: 'document' },
+      { name: 'users', type: 'document' },
+      { name: 'knowledgeBase', type: 'document' },
+      { name: 'organizations', type: 'document' },
+      { name: 'recordRelations', type: 'edge' },
+      { name: 'isOfType', type: 'edge' },
+      { name: 'permissions', type: 'edge' },
+      { name: 'belongsTo', type: 'edge' },
+      { name: 'belongsToKnowledgeBase', type: 'edge' },
+      { name: 'permissionsToKnowledgeBase', type: 'edge' },
+    ];
+
+    logger.info('Ensuring required collections exist...');
+
+    for (const collectionDef of requiredCollections) {
+      try {
+        const collection = this.db.collection(collectionDef.name);
+        const exists = await collection.exists();
+        
+        if (!exists) {
+          logger.info(`Creating ${collectionDef.type} collection: ${collectionDef.name}`);
+          
+          if (collectionDef.type === 'edge') {
+            await this.db.createEdgeCollection(collectionDef.name);
+          } else {
+            await this.db.createCollection(collectionDef.name);
+          }
+          
+          logger.info(`Successfully created collection: ${collectionDef.name}`);
+        } else {
+          logger.debug(`Collection already exists: ${collectionDef.name}`);
+        }
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error('Unknown error occurred');
+        logger.error(`Failed to create collection ${collectionDef.name}: ${err.message}`);
+        throw new InternalServerError(`Failed to create collection ${collectionDef.name}`, err);
+      }
+    }
+
+    logger.info('All required collections are available');
   }
 }
