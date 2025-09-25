@@ -1,4 +1,4 @@
-// RecordDocumentViewer.tsx - Viewport Mode (Full height below navbar)
+// RecordDocumentViewer.tsx - Fixed for Mail Records
 import dayjs from 'dayjs';
 import { Icon } from '@iconify/react';
 import React, { useState, useCallback, useRef, useEffect } from 'react';
@@ -10,6 +10,7 @@ import imageIcon from '@iconify-icons/vscode-icons/file-type-image';
 import excelIcon from '@iconify-icons/vscode-icons/file-type-excel2';
 import defaultFileIcon from '@iconify-icons/mdi/file-document-outline';
 import powerpointIcon from '@iconify-icons/vscode-icons/file-type-powerpoint2';
+import emailIcon from '@iconify-icons/mdi/email-outline'; // Add email icon
 import eyeIcon from '@iconify-icons/mdi/eye';
 import closeIcon from '@iconify-icons/mdi/close';
 import fullscreenIcon from '@iconify-icons/mdi/fullscreen';
@@ -31,7 +32,6 @@ import {
 
 import axios from 'src/utils/axios';
 import { CONFIG } from 'src/config-global';
-import { handleDownloadDocument } from './utils';
 import type { Record } from './types/record-details';
 import { getConnectorPublicUrl } from '../accountdetails/account-settings/services/utils/services-configuration-service';
 import { ORIGIN } from './constants/knowledge-search';
@@ -41,6 +41,7 @@ import ExcelViewer from '../qna/chatbot/components/excel-highlighter';
 import HtmlViewer from '../qna/chatbot/components/html-highlighter';
 import TextViewer from '../qna/chatbot/components/text-highlighter';
 import MarkdownViewer from '../qna/chatbot/components/markdown-highlighter';
+import { KnowledgeBaseAPI } from './services/api';
 
 // Simplified state management for viewport mode
 interface DocumentViewerState {
@@ -53,8 +54,13 @@ interface DocumentViewerState {
   loadingStep: string;
 }
 
-// Keep the existing utility functions
-const getFileIcon = (extension: string) => {
+// Enhanced utility functions to handle both file and mail records
+const getFileIcon = (extension: string, recordType?: string) => {
+  // Handle mail records
+  if (recordType === 'MAIL') {
+    return emailIcon;
+  }
+
   const ext = extension?.replace('.', '').toLowerCase();
   switch (ext) {
     case 'pdf':
@@ -80,7 +86,12 @@ const getFileIcon = (extension: string) => {
   }
 };
 
-const getExtensionColor = (extension: string) => {
+const getExtensionColor = (extension: string, recordType?: string) => {
+  // Handle mail records
+  if (recordType === 'MAIL') {
+    return '#1976d2'; // Blue for emails
+  }
+
   const ext = extension?.replace('.', '').toLowerCase();
   switch (ext) {
     case 'pdf':
@@ -103,13 +114,19 @@ const getExtensionColor = (extension: string) => {
   }
 };
 
-function getDocumentType(extension: string) {
+function getDocumentType(extension: string, recordType?: string) {
+  // Handle mail records - treat as HTML for rendering
+  if (recordType === 'MAIL') {
+    return 'html';
+  }
+
   if (extension === 'pdf') return 'pdf';
   if (['xlsx', 'xls', 'csv'].includes(extension)) return 'excel';
   if (extension === 'docx') return 'docx';
   if (extension === 'html') return 'html';
   if (extension === 'txt') return 'text';
   if (extension === 'md') return 'md';
+  if (extension === 'mdx') return 'mdx';
   return 'other';
 }
 
@@ -428,22 +445,29 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
     [record, handleCloseViewer]
   );
 
-  // Early return AFTER all hooks
-  if (!record?.fileRecord) return null;
+  // Fixed early return - check for either fileRecord OR mailRecord
+  if (!record?.fileRecord && !record?.mailRecord) return null;
 
-  const { recordName, externalRecordId, sourceCreatedAtTimestamp, fileRecord, origin } = record;
+  const {
+    recordName,
+    externalRecordId,
+    sourceCreatedAtTimestamp,
+    fileRecord,
+    mailRecord,
+    origin,
+    recordType,
+  } = record;
+
+  // Get the appropriate record data and extension
+  const currentRecord = fileRecord || mailRecord;
+  const extension = fileRecord?.extension || 'eml'; // Use 'eml' for email records
+  const recordTypeForDisplay = recordType || 'FILE';
 
   const handleDownload = async () => {
     try {
-      if (origin === 'CONNECTOR') {
-        const webUrl = record.fileRecord?.webUrl || record.mailRecord?.webUrl;
-        if (webUrl) {
-          window.open(webUrl, '_blank', 'noopener,noreferrer');
-          return;
-        }
-      }
       setIsDownloading(true);
-      await handleDownloadDocument(externalRecordId, recordName);
+      const recordId = origin === ORIGIN.UPLOAD ? externalRecordId : record._key;
+      await KnowledgeBaseAPI.handleDownloadDocument(recordId, recordName, origin);
     } catch (error) {
       console.error('Failed to download document:', error);
       setSnackbar({
@@ -532,6 +556,8 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
           setViewerState((prev) => ({ ...prev, loadingStep: 'Connecting to document source...' }));
 
           let params = {};
+
+          // Handle PowerPoint files
           if (record?.fileRecord && ['pptx', 'ppt'].includes(record?.fileRecord?.extension)) {
             params = { convertTo: 'pdf' };
             if (record.fileRecord.sizeInBytes / 1048576 > 5) {
@@ -581,8 +607,9 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
         }
       }
 
-      if (fileDataLoaded && record.fileRecord) {
-        const documentType = getDocumentType(record.fileRecord.extension);
+      if (fileDataLoaded) {
+        // Use recordType to determine document type for mail records
+        const documentType = getDocumentType(extension, recordTypeForDisplay);
 
         setViewerState((prev) => ({ ...prev, loadingStep: 'Opening in viewport...' }));
 
@@ -598,10 +625,11 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
           }));
         }, 800);
 
-        if (!['pdf', 'excel', 'docx', 'html', 'text', 'md'].includes(documentType)) {
+        // Support mail records in addition to existing types
+        if (!['pdf', 'excel', 'docx', 'html', 'text', 'md', 'mdx'].includes(documentType)) {
           setSnackbar({
             open: true,
-            message: `Unsupported document type: ${record.fileRecord.extension}`,
+            message: `Unsupported document type: ${extension}`,
             severity: 'warning',
           });
           handleCloseViewer();
@@ -646,8 +674,6 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
             pdfUrl={fileUrl}
             pdfBuffer={fileBuffer}
             citations={[]}
-            // viewportMode={!isFullscreen} // Use viewport mode when not in fullscreen
-            // fullScreen={isFullscreen} // Use fullscreen when in fullscreen mode
           />
         );
       case 'docx':
@@ -700,6 +726,15 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
             buffer={fileBuffer}
           />
         );
+      case 'mdx':
+        return (
+          <MarkdownViewer
+            {...commonProps}
+            url={fileUrl}
+            citations={recordCitations?.documents || []}
+            buffer={fileBuffer}
+          />
+        );
       default:
         return null;
     }
@@ -720,65 +755,62 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
       >
         <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 3 }}>
           <Icon
-            icon={getFileIcon(fileRecord.extension)}
+            icon={getFileIcon(extension, recordTypeForDisplay)}
             width={40}
             height={40}
-            style={{ color: getExtensionColor(fileRecord.extension) }}
+            style={{ color: getExtensionColor(extension, recordTypeForDisplay) }}
           />
           <Box sx={{ flexGrow: 1 }}>
             <Typography variant="h6" gutterBottom>
               {recordName}
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              Added on {dayjs(sourceCreatedAtTimestamp).format('MMM DD, YYYY')}
+              {recordTypeForDisplay === 'MAIL' ? 'Email received' : 'Added'} on{' '}
+              {dayjs(sourceCreatedAtTimestamp).format('MMM DD, YYYY')}
             </Typography>
+            {/* Show additional info for email records */}
+            {recordTypeForDisplay === 'MAIL' && mailRecord && (
+              <Typography variant="caption" color="text.secondary" display="block">
+                From: {mailRecord.from}
+              </Typography>
+            )}
           </Box>
 
-          {/* Download/Open Button - for connectors vs uploads */}
-          {origin === 'CONNECTOR' ? (
-            // Open in new tab for connector records
-            <Tooltip title="Open in new tab" arrow placement="top">
-              <IconButton
-                onClick={handleDownload} // This handles the connector opening logic
-                sx={{
-                  color: 'primary.main',
-                  '&:hover': {
-                    backgroundColor: 'primary.light',
-                    color: 'white',
-                  },
-                }}
-                disabled={viewerState.phase === 'loading'}
-              >
-                <Icon icon={openInNewIcon} width={24} />
-              </IconButton>
-            </Tooltip>
-          ) : (
-            // Download for uploaded files
-            <Tooltip title="Download document" arrow placement="top">
-              {isDownloading ? (
-                <Box sx={{ p: 1 }}>
-                  <CircularProgress size={24} />
-                </Box>
-              ) : (
-                <IconButton
-                  onClick={handleDownload}
-                  sx={{
-                    color: 'primary.main',
-                    '&:hover': {
-                      backgroundColor: 'primary.light',
-                      color: 'white',
-                    },
-                  }}
-                  disabled={viewerState.phase === 'loading'}
-                >
-                  <Icon icon={downloadIcon} width={24} />
-                </IconButton>
-              )}
-            </Tooltip>
-          )}
+          {/* Download Button */}
+          <Tooltip title="Download document" arrow placement="top">
+            {isDownloading ? (
+              <Box sx={{ p: 1 }}>
+                <CircularProgress size={24} />
+              </Box>
+            ) : (
+              <>
+                {recordTypeForDisplay !== 'MAIL' && (
+                  <>
+                    <IconButton
+                      onClick={handleDownload}
+                      sx={{
+                        color: 'primary.main',
+                        '&:hover': {
+                          backgroundColor: 'primary.light',
+                          color: 'white',
+                        },
+                      }}
+                      disabled={viewerState.phase === 'loading'}
+                    >
+                      <Icon icon={downloadIcon} width={24} />
+                    </IconButton>
+                  </>
+                )}
+              </>
+            )}
+          </Tooltip>
 
           {/* View Document Button */}
-          <Tooltip title="Preview document" arrow placement="top">
+          <Tooltip
+            title={recordTypeForDisplay === 'MAIL' ? 'Preview email' : 'Preview document'}
+            arrow
+            placement="top"
+          >
             <IconButton
               onClick={viewDocument}
               sx={{
@@ -833,10 +865,10 @@ const RecordDocumentViewer = ({ record }: RecordDocumentViewerProps) => {
               >
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                   <Icon
-                    icon={getFileIcon(fileRecord.extension)}
+                    icon={getFileIcon(extension, recordTypeForDisplay)}
                     width={24}
                     height={24}
-                    style={{ color: getExtensionColor(fileRecord.extension) }}
+                    style={{ color: getExtensionColor(extension, recordTypeForDisplay) }}
                   />
                   <Typography variant="h6" noWrap>
                     {recordName}

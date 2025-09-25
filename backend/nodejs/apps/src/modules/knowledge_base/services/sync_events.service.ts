@@ -7,6 +7,8 @@ export enum EventType {
   ReindexAllRecordEvent = 'reindexFailed',
   SyncDriveEvent = 'drive.resync',
   SyncGmailEvent = 'gmail.resync',
+  SyncOneDriveEvent = 'onedrive.resync',
+  SyncSharePointOnlineEvent = 'sharepointonline.resync',
 }
 
 export interface Event {
@@ -24,7 +26,7 @@ export interface ReindexAllRecordEvent {
   sourceCreatedAtTimestamp: string;
 }
 
-export interface SyncDriveEvent {
+interface BaseSyncEvent {
   orgId: string;
   connector: string;
   origin: string;
@@ -33,14 +35,10 @@ export interface SyncDriveEvent {
   sourceCreatedAtTimestamp: string;
 }
 
-export interface SyncGmailEvent {
-  orgId: string;
-  connector: string;
-  origin: string;
-  createdAtTimestamp: string;
-  updatedAtTimestamp: string;
-  sourceCreatedAtTimestamp: string;
-}
+export interface SyncDriveEvent extends BaseSyncEvent {}
+export interface SyncGmailEvent extends BaseSyncEvent {}
+export interface SyncOneDriveEvent extends BaseSyncEvent {}
+export interface SyncSharePointOnlineEvent extends BaseSyncEvent {}
 
 @injectable()
 export class SyncEventProducer extends BaseKafkaProducerConnection {

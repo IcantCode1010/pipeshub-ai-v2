@@ -1,12 +1,16 @@
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
+from app.config.constants.arangodb import Connectors
 from app.config.constants.service import config_node_constants
-from app.config.utils.named_constants.arangodb_constants import Connectors
 from app.connectors.sources.google.gmail.services.event_service.event_service import (
     GmailEventService,
 )
 from app.connectors.sources.google.google_drive.services.event_service.event_service import (
     GoogleDriveEventService,
+)
+from app.connectors.sources.microsoft.onedrive.event_service import OneDriveEventService
+from app.connectors.sources.microsoft.sharepoint_online.event_service import (
+    SharePointOnlineEventService,
 )
 from app.containers.connector import ConnectorAppContainer
 from app.containers.indexing import IndexingAppContainer
@@ -230,7 +234,7 @@ class KafkaUtils:
 
 
                 # Route sync events to appropriate connectors
-                if connector == Connectors.GOOGLE_MAIL.value:
+                if connector.lower() == Connectors.GOOGLE_MAIL.value.lower():
                     # Create the sync event service
                     gmail_sync_tasks = sync_tasks_registry.get('gmail')
                     if not gmail_sync_tasks:
@@ -246,7 +250,7 @@ class KafkaUtils:
                     logger.info(f"Processing sync event: {event_type} for GMAIL")
                     return await gmail_event_service.process_event(event_type, payload)
 
-                elif connector == Connectors.GOOGLE_DRIVE.value:
+                elif connector.lower() == Connectors.GOOGLE_DRIVE.value.lower():
                     drive_sync_tasks = sync_tasks_registry.get('drive')
                     if not drive_sync_tasks:
                         logger.error("Drive sync tasks not found in registry")
@@ -261,6 +265,23 @@ class KafkaUtils:
                     logger.info(f"Processing sync event: {event_type} for GOOGLE DRIVE")
                     return await google_drive_event_service.process_event(event_type, payload)
 
+                elif connector.lower() == Connectors.ONEDRIVE.value.lower():
+                    onedrive_event_service = OneDriveEventService(
+                        logger=logger,
+                        arango_service=arango_service,
+                        app_container=app_container,
+                    )
+
+                    logger.info(f"Processing sync event: {event_type} for MICROSOFT ONEDRIVE")
+                    return await onedrive_event_service.process_event(event_type, payload)
+
+                elif connector.replace(" ", "").lower() == Connectors.SHAREPOINT_ONLINE.value.replace(" ", "").lower():
+                    sharepoint_event_service = SharePointOnlineEventService(
+                        logger=logger,
+                        arango_service=arango_service,
+                        app_container=app_container,
+                    )
+                    return await sharepoint_event_service.process_event(event_type, payload)
                 else:
                     logger.warning(f"Unknown connector in sync message: {connector}")
                     return False

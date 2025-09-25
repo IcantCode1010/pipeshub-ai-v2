@@ -51,6 +51,11 @@ import {
   getModelsByType,
   getAtlassianOauthConfig,
   setAtlassianOauthConfig,
+  getOneDriveCredentials,
+  getSharePointCredentials,
+  setSharePointCredentials,
+  setOneDriveCredentials,
+  getConnectorConfig,
 } from '../controller/cm_controller';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
@@ -78,6 +83,8 @@ import {
   addProviderRequestSchema,
   updateProviderRequestSchema,
   atlassianCredentialsSchema,
+  onedriveCredentialsSchema,
+  sharepointCredentialsSchema,
 } from '../validator/validators';
 import { FileProcessorFactory } from '../../../libs/middlewares/file_processor/fp.factory';
 import { FileProcessingType } from '../../../libs/middlewares/file_processor/fp.constant';
@@ -185,11 +192,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
       if (!req.tokenPayload) {
         throw new NotFoundError('User not found');
       }
-      return getAtlassianOauthConfig(keyValueStoreService)(
-        req,
-        res,
-        next,
-      );
+      return getAtlassianOauthConfig(keyValueStoreService)(req, res, next);
     },
   );
 
@@ -202,11 +205,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
       if (!req.user) {
         throw new NotFoundError('User not found');
       }
-      return getAtlassianOauthConfig(keyValueStoreService)(
-        req,
-        res,
-        next,
-      );
+      return getAtlassianOauthConfig(keyValueStoreService)(req, res, next);
     },
   );
 
@@ -220,11 +219,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
       if (!req.user) {
         throw new NotFoundError('User not found');
       }
-      return setAtlassianOauthConfig(keyValueStoreService)(
-        req,
-        res,
-        next,
-      );
+      return setAtlassianOauthConfig(keyValueStoreService)(req, res, next);
     },
   );
 
@@ -237,11 +232,100 @@ export function createConfigurationManagerRouter(container: Container): Router {
       if (!req.tokenPayload) {
         throw new NotFoundError('User not found');
       }
-      return setAtlassianOauthConfig(keyValueStoreService)(
-        req,
-        res,
-        next,
-      );
+      return setAtlassianOauthConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.get(
+    '/connectors/onedrive/config',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return getOneDriveCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/internal/connectors/onedrive/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(onedriveCredentialsSchema),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return setOneDriveCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.get(
+    '/connectors/sharepoint/config',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return getSharePointCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/internal/connectors/sharepoint/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(sharepointCredentialsSchema),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return setSharePointCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  // Generic internal connector config fetch: /internal/connectors/:connector/config
+  router.get(
+    '/internal/connectors/:connector/config',
+    authMiddleware.scopedTokenValidator(TokenScopes.FETCH_CONFIG),
+    metricsMiddleware(container),
+    (req: AuthenticatedServiceRequest, res: Response, next: NextFunction) => {
+      if (!req.tokenPayload) {
+        throw new NotFoundError('User not found');
+      }
+      return getConnectorConfig(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/connectors/sharepoint/config',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(sharepointCredentialsSchema),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return setSharePointCredentials(keyValueStoreService)(req, res, next);
+    },
+  );
+
+  router.post(
+    '/connectors/onedrive/config',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(onedriveCredentialsSchema),
+    (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        throw new NotFoundError('User not found');
+      }
+      return setOneDriveCredentials(keyValueStoreService)(req, res, next);
     },
   );
 
@@ -715,7 +799,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
   /**
    * @route GET /api/v1/conversations/ai-models
    * @desc Get all AI models providers (direct Node.js implementation)
-   * @access Private 
+   * @access Private
    */
   router.get(
     '/ai-models',
@@ -732,15 +816,15 @@ export function createConfigurationManagerRouter(container: Container): Router {
    * @param {string} modelType - Type of model (llm, embedding, ocr, slm, reasoning, multiModal)
    */
 
-    router.get(
-      '/ai-models/:modelType',
-      authMiddleware.authenticate,
-      userAdminCheck,
-      metricsMiddleware(container),
-      ValidationMiddleware.validate(modelTypeSchema),
-      getModelsByType(keyValueStoreService),
-    );
-    
+  router.get(
+    '/ai-models/:modelType',
+    authMiddleware.authenticate,
+    userAdminCheck,
+    metricsMiddleware(container),
+    ValidationMiddleware.validate(modelTypeSchema),
+    getModelsByType(keyValueStoreService),
+  );
+
   /**
    * @route GET /api/v1/conversations/ai-models/available/:modelType
    * @desc Get available models of a specific type in flattened format
@@ -862,7 +946,6 @@ export function createConfigurationManagerRouter(container: Container): Router {
     metricsMiddleware(container),
     toggleMetricsCollection(keyValueStoreService),
   );
-
 
   router.post(
     '/internal/metricsCollection/toggle',

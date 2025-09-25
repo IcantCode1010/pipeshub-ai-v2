@@ -128,9 +128,7 @@ class EventProcessor:
                         f"Download failed after {max_retries} attempts. "
                         f"Error: {error_type} - {str(e)}. File id: {record_id}"
                     )
-
                 await asyncio.sleep(delay)
-
             finally:
                 if not file_buffer.closed:
                     file_buffer.close()
@@ -156,7 +154,6 @@ class EventProcessor:
             record_id = event_data.get("recordId")
             org_id = event_data.get("orgId")
             virtual_record_id = event_data.get("virtualRecordId")
-
             self.logger.info(f"📥 Processing event: {event_type}: {record_id}")
 
             if not record_id:
@@ -193,9 +190,6 @@ class EventProcessor:
             record_type = event_data.get("recordType", "unknown")
             record_name = event_data.get("recordName", f"Untitled-{record_id}")
 
-            if extension is None and mime_type != "text/gmail_content":
-                extension = event_data["recordName"].split(".")[-1]
-
             if mime_type == "text/gmail_content":
                 self.logger.info("🚀 Processing Gmail Message")
                 result = await self.processor.process_gmail_message(
@@ -218,8 +212,7 @@ class EventProcessor:
             else:
                 file_content = event_data.get("buffer")
 
-            self.logger.debug(f"file_content type: {type(file_content)} length: {len(file_content)} {file_content}")
-
+            self.logger.debug(f"file_content type: {type(file_content)} length: {len(file_content)}")
 
             record_type = doc.get("recordType")
             if record_type == RecordTypes.FILE.value:
@@ -371,15 +364,22 @@ class EventProcessor:
                 return result
 
             if extension == ExtensionTypes.PDF.value:
-                result = await self.processor.process_pdf_document(
+                result = await self.processor.process_pdf_with_docling(
                     recordName=record_name,
                     recordId=record_id,
-                    version=record_version,
-                    source=connector,
-                    orgId=org_id,
                     pdf_binary=file_content,
                     virtual_record_id = virtual_record_id
                 )
+                if result is False:
+                    result = await self.processor.process_pdf_document(
+                        recordName=record_name,
+                        recordId=record_id,
+                        version=record_version,
+                        source=connector,
+                        orgId=org_id,
+                        pdf_binary=file_content,
+                        virtual_record_id = virtual_record_id
+                    )
 
             elif extension == ExtensionTypes.DOCX.value:
                 result = await self.processor.process_docx_document(
@@ -388,7 +388,7 @@ class EventProcessor:
                     version=record_version,
                     source=connector,
                     orgId=org_id,
-                    docx_binary=BytesIO(file_content),
+                    docx_binary=file_content,
                     virtual_record_id = virtual_record_id
                 )
 
@@ -430,7 +430,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     csv_binary=file_content,
-                    virtual_record_id = virtual_record_id
+                    virtual_record_id = virtual_record_id,
+                    origin=origin,
                 )
 
             elif extension == ExtensionTypes.HTML.value:

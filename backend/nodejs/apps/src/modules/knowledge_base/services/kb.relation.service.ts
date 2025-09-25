@@ -38,6 +38,8 @@ import {
   EventType as SyncEventType,
   SyncDriveEvent,
   SyncGmailEvent,
+  SyncOneDriveEvent,
+  SyncSharePointOnlineEvent,
 } from './sync_events.service';
 import {
   IServiceFileRecord,
@@ -2784,9 +2786,19 @@ export class RecordRelationService {
 
       const event: SyncEvent = {
         eventType:
-          resyncConnectorEventPayload.connector === 'GMAIL'
-            ? SyncEventType.SyncGmailEvent
-            : SyncEventType.SyncDriveEvent,
+          (() => {
+            switch (resyncConnectorEventPayload.connector) {
+              case 'GMAIL':
+                return SyncEventType.SyncGmailEvent;
+              case 'ONEDRIVE':
+                return SyncEventType.SyncOneDriveEvent;
+              case 'SHAREPOINT ONLINE':
+                return SyncEventType.SyncSharePointOnlineEvent;
+              default:
+                return SyncEventType.SyncDriveEvent;
+            }
+          })()
+        ,
         timestamp: Date.now(),
         payload: resyncConnectorEventPayload,
       };
@@ -2808,7 +2820,7 @@ export class RecordRelationService {
 
   async createResyncConnectorEventPayload(
     resyncConnectorEventPayload: any,
-  ): Promise<SyncDriveEvent | SyncGmailEvent> {
+  ): Promise<SyncDriveEvent | SyncGmailEvent | SyncOneDriveEvent | SyncSharePointOnlineEvent> {
     const connectorName = resyncConnectorEventPayload.connectorName;
 
     return {

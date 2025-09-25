@@ -32,6 +32,11 @@ import { UserGroups } from '../schema/userGroup.schema';
 import { AuthService } from '../services/auth.service';
 import { Org } from '../schema/org.schema';
 import { UserCredentials } from '../../auth/schema/userCredentials.schema';
+import { AICommandOptions } from '../../../libs/commands/ai_service/ai.service.command';
+import { AIServiceCommand } from '../../../libs/commands/ai_service/ai.service.command';
+import { HttpMethod } from '../../../libs/enums/http-methods.enum';
+import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
+
 @injectable()
 export class UserController {
   constructor(
@@ -922,6 +927,7 @@ export class UserController {
         });
         return;
       }
+      let errorSendingMail = false;
 
       await this.eventService.start();
       for (let i = 0; i < emailsForNewAccounts.length; ++i) {
@@ -943,6 +949,18 @@ export class UserController {
           { $addToSet: { users: userId } }, // Add user to the group if not already present
         );
 
+        const event: Event = {
+          eventType: EventType.NewUserEvent,
+          timestamp: Date.now(),
+          payload: {
+            orgId: req.user?.orgId.toString(),
+            userId: userId,
+            email: email,
+            syncAction: 'immediate',
+          } as UserAddedEvent,
+        };
+        await this.eventService.publishEvent(event);
+
         const authToken = fetchConfigJwtGenerator(
           userId.toString(),
           req.user?.orgId,
@@ -977,7 +995,8 @@ export class UserController {
             },
           });
           if (result.statusCode !== 200) {
-            throw new InternalServerError('Error sending invite');
+            errorSendingMail = true;
+            continue;
           }
         } else {
           result = await this.mailService.sendMail({
@@ -997,22 +1016,10 @@ export class UserController {
             },
           });
           if (result.statusCode !== 200) {
-            throw new InternalServerError('Error sending invite');
+            errorSendingMail = true;
+            continue;
           }
         }
-
-        const event: Event = {
-          eventType: EventType.NewUserEvent,
-          timestamp: Date.now(),
-          payload: {
-            orgId: req.user?.orgId.toString(),
-            userId: userId,
-            email: email,
-            syncAction: 'immediate',
-          } as UserAddedEvent,
-        };
-
-        await this.eventService.publishEvent(event);
       }
 
       const emailsForRestoredAccounts = restoredUsers.map((user) => user.email);
@@ -1029,6 +1036,18 @@ export class UserController {
             'User ID missing while inviting restored user. Please ensure user restoration was successful.',
           );
         }
+        const event: Event = {
+          eventType: EventType.NewUserEvent,
+          timestamp: Date.now(),
+          payload: {
+            orgId: req.user?.orgId.toString(),
+            userId: userId,
+            email: email,
+            syncAction: 'immediate',
+          } as UserAddedEvent,
+        };
+        await this.eventService.publishEvent(event);
+
         const authToken = fetchConfigJwtGenerator(
           userId.toString(),
           req.user?.orgId,
@@ -1063,7 +1082,8 @@ export class UserController {
             },
           });
           if (result.statusCode !== 200) {
-            throw new InternalServerError('Error sending invite');
+            errorSendingMail = true;
+            continue;
           }
         } else {
           result = await this.mailService.sendMail({
@@ -1083,28 +1103,122 @@ export class UserController {
             },
           });
           if (result.statusCode !== 200) {
-            throw new InternalServerError('Error sending invite');
+            errorSendingMail = true;
+            continue;
           }
         }
+      }
 
-        const event: Event = {
-          eventType: EventType.NewUserEvent,
-          timestamp: Date.now(),
-          payload: {
-            orgId: req.user?.orgId.toString(),
-            userId: userId,
-            email: email,
-            syncAction: 'immediate',
-          } as UserAddedEvent,
-        };
+      await this.eventService.stop();
 
-        await this.eventService.publishEvent(event);
-        res.status(200).json({ message: 'Invite sent successfully' });
+      if (errorSendingMail) {
+        res.status(200).json({
+          message: 'Error sending mail invite. Check your SMTP configuration.',
+        });
         return;
       }
-      await this.eventService.stop();
+
       res.status(200).json({ message: 'Invite sent successfully' });
     } catch (error) {
+      next(error);
+    }
+  }
+
+  async listUsers(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+      
+      const { page, limit, search } = req.query;
+      const queryParams = new URLSearchParams();
+      if (page) queryParams.append('page', String(page));
+      if (limit) queryParams.append('limit', String(limit));
+      if (search) queryParams.append('search', String(search));
+      const queryString = queryParams.toString();
+
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/user/list?${queryString}`,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+        method: HttpMethod.GET,
+      };
+      const aiCommand = new AIServiceCommand(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (aiResponse && aiResponse.statusCode !== 200) {
+        throw new BadRequestError('Failed to get users');
+      }
+      const users = aiResponse.data;
+      res.status(HTTP_STATUS.OK).json(users);
+    } catch (error: any) {
+      this.logger.error('Error getting users', {
+        requestId,
+        message: 'Error getting users',
+        error: error.message,
+      });
+      next(error);
+    }
+  }
+
+  async getUserTeams(
+    req: AuthenticatedUserRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const requestId = req.context?.requestId;
+    try {
+      const orgId = req.user?.orgId;
+      const userId = req.user?.userId;
+      if (!orgId) {
+        throw new BadRequestError('Organization ID is required');
+      }
+      if (!userId) {
+        throw new BadRequestError('User ID is required');
+      }
+      const { page, limit, search } = req.query;
+      let queryString = '';
+      if (page) {
+        queryString += `&page=${page}`;
+      }
+      if (limit) {
+        queryString += `&limit=${limit}`;
+      }
+      if (search) {
+        queryString += `&search=${search}`;
+      }
+      const aiCommandOptions: AICommandOptions = {
+        uri: `${this.config.connectorBackend}/api/v1/entity/user/teams?${queryString}`,
+        headers: {
+          ...(req.headers as Record<string, string>),
+          'Content-Type': 'application/json',
+        },
+        method: HttpMethod.GET,
+      };
+      const aiCommand = new AIServiceCommand(aiCommandOptions);
+      const aiResponse = await aiCommand.execute();
+      if (aiResponse && aiResponse.statusCode !== 200) {
+        throw new BadRequestError('Failed to get user teams');
+      }
+      const userTeams = aiResponse.data;
+      res.status(HTTP_STATUS.OK).json(userTeams);
+    } catch (error: any) {
+      this.logger.error('Error getting user teams', {
+        requestId,
+        message: 'Error getting user teams',
+        error: error.message,
+      });
       next(error);
     }
   }

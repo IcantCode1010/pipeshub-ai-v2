@@ -3,19 +3,36 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator, List
 
 import uvicorn
+from dependency_injector import providers
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.middlewares.auth import authMiddleware
+from app.api.routes.entity import router as entity_router
 from app.config.constants.arangodb import AccountType, Connectors
 from app.connectors.api.router import router
+from app.connectors.core.base.data_store.arango_data_store import ArangoDataStore
+from app.connectors.core.base.token_service.startup_service import startup_service
+from app.connectors.core.registry.connector import (
+    GmailConnector,
+    GoogleDriveConnector,
+)
+from app.connectors.core.registry.connector_registry import (
+    ConnectorRegistry,
+)
 from app.connectors.sources.localKB.api.kb_router import kb_router
+from app.connectors.sources.microsoft.onedrive.connector import (
+    OneDriveConnector,
+)
+from app.connectors.sources.microsoft.sharepoint_online.connector import (
+    SharePointConnector,
+)
 from app.containers.connector import (
     ConnectorAppContainer,
     initialize_container,
-    initialize_enterprise_account_services_fn,
-    initialize_individual_account_services_fn,
+    initialize_enterprise_google_account_services_fn,
+    initialize_individual_google_account_services_fn,
 )
 from app.services.messaging.kafka.utils.utils import KafkaUtils
 from app.services.messaging.messaging_factory import MessagingFactory
@@ -35,11 +52,17 @@ async def get_initialized_container() -> ConnectorAppContainer:
                 "app.connectors.sources.google.common.sync_tasks",
                 "app.connectors.api.router",
                 "app.connectors.sources.localKB.api.kb_router",
+                "app.api.routes.entity",
                 "app.connectors.api.middleware",
                 "app.core.signed_url",
             ]
         )
         setattr(get_initialized_container, "_initialized", True)
+        # Start token refresh service at app startup
+        try:
+            await startup_service.initialize(container.key_value_store(), await container.arango_service())
+        except Exception as e:
+            container.logger().warning(f"Startup token refresh service failed to initialize: {e}")
     return container
 
 
@@ -58,17 +81,18 @@ async def resume_sync_services(app_container: ConnectorAppContainer) -> bool:
             return True
 
         logger.info("Found %d organizations in the system", len(orgs))
-
         # Process each organization
         for org in orgs:
             org_id = org["_key"]
             accountType = org.get("accountType", AccountType.INDIVIDUAL.value)
-
+            enabled_apps = await arango_service.get_org_apps(org_id)
+            app_names = [app["name"].replace(" ", "").lower() for app in enabled_apps]
+            logger.info(f"App names: {app_names}")
             # Ensure the method is called on the correct object
             if accountType == AccountType.ENTERPRISE.value or accountType == AccountType.BUSINESS.value:
-                await initialize_enterprise_account_services_fn(org_id, app_container)
+                await initialize_enterprise_google_account_services_fn(org_id, app_container, app_names)
             elif accountType == AccountType.INDIVIDUAL.value:
-                await initialize_individual_account_services_fn(org_id, app_container)
+                await initialize_individual_google_account_services_fn(org_id, app_container, app_names)
             else:
                 logger.error("Account Type not valid")
                 continue
@@ -86,25 +110,46 @@ async def resume_sync_services(app_container: ConnectorAppContainer) -> bool:
 
             logger.info("Found %d users for organization %s", len(users), org_id)
 
-            enabled_apps = await arango_service.get_org_apps(org_id)
 
             drive_sync_service = None
             gmail_sync_service = None
-
+            onedrive_connector = None
+            sharepoint_connector = None
             for app in enabled_apps:
-                if app["name"] == Connectors.GOOGLE_CALENDAR.value:
+                if app["name"].lower() == Connectors.GOOGLE_CALENDAR.value.lower():
                     logger.info("Skipping calendar sync for org %s", org_id)
                     continue
 
-                if app["name"] == Connectors.GOOGLE_DRIVE.value:
+                if app["name"].lower() == Connectors.GOOGLE_DRIVE.value.lower():
                     drive_sync_service = app_container.drive_sync_service()  # type: ignore
                     await drive_sync_service.initialize(org_id)  # type: ignore
                     logger.info("Drive Service initialized for org %s", org_id)
 
-                if app["name"] == Connectors.GOOGLE_MAIL.value:
+                if app["name"].lower() == Connectors.GOOGLE_MAIL.value.lower():
                     gmail_sync_service = app_container.gmail_sync_service()  # type: ignore
                     await gmail_sync_service.initialize(org_id)  # type: ignore
                     logger.info("Gmail Service initialized for org %s", org_id)
+
+                if app["name"].lower() == Connectors.ONEDRIVE.value.lower():
+                    config_service = app_container.config_service()
+                    arango_service = await app_container.arango_service()
+                    data_store_provider = ArangoDataStore(logger, arango_service)
+                    onedrive_connector = await OneDriveConnector.create_connector(logger, data_store_provider, config_service)
+                    await onedrive_connector.init()
+                    app_container.onedrive_connector.override(providers.Object(onedrive_connector))
+                    asyncio.create_task(onedrive_connector.run_sync())
+                    logger.info("OneDrive connector initialized for org %s", org_id)
+
+                if app["name"].lower() == Connectors.SHAREPOINT_ONLINE.value.lower():
+                    config_service = app_container.config_service()
+                    arango_service = await app_container.arango_service()
+                    data_store_provider = ArangoDataStore(logger, arango_service)
+
+                    sharepoint_connector = await SharePointConnector.create_connector(logger, data_store_provider, config_service)
+                    await sharepoint_connector.init()
+                    app_container.sharepoint_connector.override(providers.Object(sharepoint_connector))
+                    asyncio.create_task(sharepoint_connector.run_sync())
+                    logger.info("SharePoint connector initialized for org %s", org_id)
 
             if drive_sync_service is not None:
                 try:
@@ -141,6 +186,32 @@ async def resume_sync_services(app_container: ConnectorAppContainer) -> bool:
     except Exception as e:
         logger.error("❌ Error during sync service resumption: %s", str(e))
         return False
+
+async def initialize_connector_registry(app_container: ConnectorAppContainer) -> ConnectorRegistry:
+    """Initialize and sync connector registry with database"""
+    logger = app_container.logger()
+    logger.info("🔧 Initializing Connector Registry...")
+
+    try:
+        registry = ConnectorRegistry(app_container)
+
+        # Register connectors (in production, use discovery from modules)
+        registry.register_connector(GoogleDriveConnector)
+        registry.register_connector(GmailConnector)
+        registry.register_connector(OneDriveConnector)
+        registry.register_connector(SharePointConnector)
+
+        logger.info(f"Registered {len(registry._connectors)} connectors")
+
+        # Sync with database
+        await registry.sync_with_database()
+        logger.info("✅ Connector registry synchronized with database")
+
+        return registry
+
+    except Exception as e:
+        logger.error(f"❌ Error initializing connector registry: {str(e)}")
+        raise
 
 async def start_messaging_producer(app_container: ConnectorAppContainer) -> None:
     """Start messaging producer and attach it to container"""
@@ -256,6 +327,12 @@ async def shutdown_container_resources(container: ConnectorAppContainer) -> None
         # Stop messaging producer
         await stop_messaging_producer(container)
 
+        # Stop startup services (token refresh)
+        try:
+            await startup_service.shutdown()
+        except Exception as e:
+            logger.warning(f"Error shutting down startup services: {e}")
+
         logger.info("✅ All container resources shut down successfully")
 
     except Exception as e:
@@ -271,7 +348,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.config_service = app_container.config_service()
     app.state.arango_service = await app_container.arango_service()  # type: ignore
 
+    # Initialize connector registry
     logger = app_container.logger()
+    registry = await initialize_connector_registry(app_container)
+    app.state.connector_registry = registry
+    logger.info("✅ Connector registry initialized and synchronized with database")
+
+
     logger.debug("🚀 Starting application")
     # Start messaging producer first
     try:
@@ -312,13 +395,18 @@ app = FastAPI(
 )
 
 # List of paths to apply authentication to
-INCLUDE_PATHS = ["/api/v1/stream/record/", "/api/v1/delete/"]
-
+INCLUDE_PATHS = ["/api/v1/stream/record/", "/api/v1/delete/", "/api/v1/entity/", "/api/v1/connectors/"]
 
 @app.middleware("http")
 async def authenticate_requests(request: Request, call_next)-> JSONResponse:
     logger = app.container.logger()  # type: ignore
     logger.info(f"Middleware request: {request.url.path}")
+
+    # Check if path should be excluded from authentication (OAuth callbacks)
+    if "/oauth/callback" in request.url.path:
+        # Skip authentication for OAuth callbacks
+        return await call_next(request)
+
     # Apply middleware only to specific paths
     if not any(request.url.path.startswith(path) for path in INCLUDE_PATHS):
         # Skip authentication for other paths
@@ -375,9 +463,11 @@ async def health_check() -> JSONResponse:
         )
 
 
-# Include routes
-app.include_router(router)
+# Include routes - more specific routes first
+app.include_router(entity_router)
 app.include_router(kb_router)
+app.include_router(router)
+
 
 
 # Global error handler

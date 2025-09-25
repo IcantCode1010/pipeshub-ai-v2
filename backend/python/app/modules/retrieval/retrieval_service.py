@@ -1,17 +1,18 @@
 import asyncio
-import time
 from typing import Any, Dict, List, Optional
 
 from langchain.chat_models.base import BaseChatModel
 from langchain.embeddings.base import Embeddings
+from langchain.schema import Document
 from langchain_qdrant import FastEmbedSparse, QdrantVectorStore, RetrievalMode
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import FieldCondition, Filter, MatchValue
+from qdrant_client import models
 
 from app.config.configuration_service import ConfigurationService
 from app.config.constants.ai_models import (
     DEFAULT_EMBEDDING_MODEL,
 )
+
+# from langchain_cohere import CohereEmbeddings
 from app.config.constants.arangodb import (
     CollectionNames,
     Connectors,
@@ -22,11 +23,13 @@ from app.exceptions.embedding_exceptions import EmbeddingModelCreationError
 from app.exceptions.fastapi_responses import Status
 from app.exceptions.indexing_exceptions import IndexingError
 from app.modules.retrieval.retrieval_arango import ArangoService
+from app.services.vector_db.interface.vector_db import IVectorDBService
 from app.utils.aimodels import (
     get_default_embedding_model,
     get_embedding_model,
     get_generator_model,
 )
+from app.utils.mimetype_to_extension import get_extension_from_mimetype
 
 
 class RetrievalService:
@@ -35,20 +38,22 @@ class RetrievalService:
         logger,
         config_service: ConfigurationService,
         collection_name: str,
-        qdrant_client: QdrantClient,
+        vector_db_service: IVectorDBService,
+        arango_service: ArangoService,
     ) -> None:
         """
         Initialize the retrieval service with necessary configurations.
 
         Args:
-            collection_name: Name of the Qdrant collection
-            qdrant_api_key: API key for Qdrant
-            qdrant_host: Qdrant server host URL
+            collection_name: Name of the collection
+            vector_db_service: Vector DB service
+            config_service: Configuration service
         """
 
         self.logger = logger
         self.config_service = config_service
         self.llm = None
+        self.arango_service = arango_service
 
         # Initialize sparse embeddings
         try:
@@ -59,7 +64,7 @@ class RetrievalService:
             raise Exception(
                 "Failed to initialize sparse embeddings: " + str(e),
             )
-        self.qdrant_client = qdrant_client
+        self.vector_db_service = vector_db_service
         self.collection_name = collection_name
         self.logger.info(f"Retrieval service initialized with collection name: {self.collection_name}")
         self.vector_store = None
@@ -118,14 +123,17 @@ class RetrievalService:
                     dense_embeddings = None
                     if ai_models["embedding"]:
                         self.logger.info("No default embedding model found, using first available provider")
-                        for config in ai_models["embedding"]:
-                            if config.get("isDefault", False):
-                                dense_embeddings = get_embedding_model(config["provider"], config)
-                                break
-                        if not dense_embeddings:
-                            for config in ai_models["embedding"]:
-                                dense_embeddings = get_embedding_model(config["provider"], config)
-                                break
+                        configs = ai_models["embedding"]
+                        # Try to find the default config
+                        selected_config = next((c for c in configs if c.get("isDefault", False)), None)
+                        # If no default, take the first one
+                        if not selected_config and configs:
+                            selected_config = configs[0]
+
+                        if selected_config:
+                            dense_embeddings = get_embedding_model(selected_config["provider"], selected_config)
+                            self.logger.info(f"Embedding provider: {selected_config['provider']}")
+
 
             except Exception as e:
                 self.logger.error(f"Error creating embedding model: {str(e)}")
@@ -208,55 +216,13 @@ class RetrievalService:
         formatted_results = []
         for doc, score in results:
             formatted_result = {
-                "content": doc.page_content,
                 "score": float(score),
                 "citationType": "vectordb|document",
                 "metadata": doc.metadata,
+                "content": doc.page_content
             }
             formatted_results.append(formatted_result)
         return formatted_results
-
-    def _build_qdrant_filter(
-        self, org_id: str, accessible_virtual_record_ids: List[str]
-    ) -> Filter:
-        """
-        Build Qdrant filter for accessible records with both org_id and record_id conditions.
-
-        Args:
-            org_id: Organization ID to filter
-            accessible_records: List of record IDs the user has access to
-
-        Returns:
-            Qdrant Filter object
-        """
-        # If no accessible virtual record IDs, return a filter that will match nothing
-        if not accessible_virtual_record_ids:
-            return Filter(
-                must=[
-                    FieldCondition(  # org_id condition
-                        key="metadata.orgId", match=MatchValue(value=org_id)
-                    ),
-                    FieldCondition(  # Impossible condition to ensure no matches
-                        key="metadata.virtualRecordId", match=MatchValue(value="__nonexistent__")
-                    ),
-                ]
-            )
-
-        return Filter(
-            must=[
-                FieldCondition(  # org_id condition
-                    key="metadata.orgId", match=MatchValue(value=org_id)
-                ),
-                Filter(  # recordId must be one of the accessible_records
-                    should=[
-                        FieldCondition(
-                            key="metadata.virtualRecordId", match=MatchValue(value=virtual_record_id)
-                        )
-                        for virtual_record_id in accessible_virtual_record_ids
-                    ]
-                ),
-            ]
-        )
 
     async def search_with_filters(
         self,
@@ -266,12 +232,12 @@ class RetrievalService:
         filter_groups: Optional[Dict[str, List[str]]] = None,
         limit: int = 20,
         arango_service: Optional[ArangoService] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """Perform semantic search on accessible records with multiple queries."""
 
         try:
             # Get accessible records
-            if not arango_service:
+            if not self.arango_service:
                 raise ValueError("ArangoService is required for permission checking")
 
             filter_groups = filter_groups or {}
@@ -288,16 +254,15 @@ class RetrievalService:
                     arango_filters[metadata_key] = values
 
             init_tasks = [
-                self._get_accessible_records_task(user_id, org_id, filter_groups, arango_service),
+                self._get_accessible_records_task(user_id, org_id, filter_groups, self.arango_service),
                 self._get_vector_store_task(),
-                arango_service.get_user_by_user_id(user_id)  # Get user info in parallel
+                self.arango_service.get_user_by_user_id(user_id)  # Get user info in parallel
             ]
 
             accessible_records, vector_store, user = await asyncio.gather(*init_tasks)
-            self.logger.debug(f"Accessible records: {accessible_records}")
 
             if not accessible_records:
-                return self._create_empty_response("No accessible records found for this user with provided filters.")
+                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
 
             # FIX: Filter out None records before processing
             accessible_records = [r for r in accessible_records if r is not None]
@@ -306,13 +271,15 @@ class RetrievalService:
                 record["virtualRecordId"] for record in accessible_records
                 if record.get("virtualRecordId") is not None
             ]
-            # Build Qdrant filter
-            qdrant_filter =  self._build_qdrant_filter(org_id, accessible_virtual_record_ids)
-
-            search_results = await self._execute_parallel_searches(queries, qdrant_filter, limit, vector_store)
+            # build vector db filter
+            filter = await self.vector_db_service.filter_collection(
+                        must={"orgId": org_id},
+                        should={"virtualRecordId": accessible_virtual_record_ids}  # Pass as should condition
+                    )
+            search_results = await self._execute_parallel_searches(queries, filter, limit, vector_store)
 
             if not search_results:
-                return self._create_empty_response("No search results found")
+                return self._create_empty_response("No relevant documents found for your search query. Try using different keywords or broader search terms.", Status.EMPTY_RESPONSE)
 
             self.logger.info(f"Search results count: {len(search_results) if search_results else 0}")
 
@@ -347,7 +314,7 @@ class RetrievalService:
             unique_record_ids = set(virtual_to_record_map.values())
 
             if not unique_record_ids:
-                return self._create_empty_response("No accessible records found for this user with provided filters.")
+                return self._create_empty_response("No accessible documents found. Please check your permissions or try different search criteria.", Status.ACCESSIBLE_RECORDS_NOT_FOUND)
             self.logger.info(f"Unique record IDs count: {len(unique_record_ids)}")
 
             # Replace virtualRecordId with first accessible record ID in search results
@@ -368,6 +335,7 @@ class RetrievalService:
                     # FIX: Add null check for r before accessing r["_key"]
                     record = next((r for r in accessible_records if r and r.get("_key") == record_id), None)
                     if record:
+
                         result["metadata"]["origin"] = record.get("origin")
                         result["metadata"]["connector"] = record.get("connectorName", None)
                         result["metadata"]["kbId"] = record.get("kbId", None)
@@ -377,11 +345,17 @@ class RetrievalService:
                             if user_email:
                                 weburl = weburl.replace("{user.email}", user_email)
                         result["metadata"]["webUrl"] = weburl
+                        result["metadata"]["mimeType"] = record.get("mimeType")
+                        result["metadata"]["recordName"] = record.get("recordName")
+                        ext =  get_extension_from_mimetype(record.get("mimeType"))
+                        if ext:
+                            result["metadata"]["extension"] = ext
+
 
                         # Fetch additional file URL if needed
                         if not weburl and record.get("recordType", "") == RecordTypes.FILE.value:
                             try:
-                                files = await arango_service.get_document(
+                                files = await self.arango_service.get_document(
                                     record_id, CollectionNames.FILES.value
                                 )
                                 if files:  # Check if files is not None
@@ -397,7 +371,7 @@ class RetrievalService:
                         # Fetch additional mail URL if needed
                         if not weburl and record.get("recordType", "") == RecordTypes.MAIL.value:
                             try:
-                                mail = await arango_service.get_document(
+                                mail = await self.arango_service.get_document(
                                     record_id, CollectionNames.MAILS.value
                                 )
                                 if mail:  # Check if mail is not None
@@ -419,6 +393,19 @@ class RetrievalService:
                     if record:  # Only append non-None records
                         records.append(record)
 
+            # Filter out incomplete results to prevent citation validation failures
+            required_fields = ['origin', 'recordName', 'recordId', 'mimeType']
+            complete_results = []
+
+            for result in search_results:
+                metadata = result.get('metadata', {})
+                if all(field in metadata and metadata[field] is not None for field in required_fields):
+                    complete_results.append(result)
+                else:
+                    self.logger.warning(f"Filtering out result with incomplete metadata. Virtual ID: {metadata.get('virtualRecordId')}, Missing fields: {[f for f in required_fields if f not in metadata]}")
+
+            search_results = complete_results
+
             if search_results or records:
                 response_data = {
                     "searchResults": search_results,
@@ -437,27 +424,24 @@ class RetrievalService:
 
                 return response_data
             else:
-                return {
-                    "searchResults": [],
-                    "records": [],
-                    "status": Status.EMPTY_RESPONSE.value,
-                    "status_code": 200,
-                    "message": "Query processed, but no relevant results were found.",
-                }
+                return self._create_empty_response("No relevant documents found for your search query. Try using different keywords or broader search terms.", Status.EMPTY_RESPONSE)
 
+        except ValueError as e:
+            # Provide specific, user-friendly errors for known cases
+            # Avoid string matching: detect our dedicated error by class name
+            if e.__class__.__name__ == "VectorDBEmptyError":
+                return self._create_empty_response(
+                    "Vector database is not ready. Please index content and try again.",
+                    Status.VECTOR_DB_EMPTY,
+                )
+            return self._create_empty_response(f"Bad request: {str(e)}", Status.ERROR)
         except Exception as e:
             import traceback
             tb_str = traceback.format_exc()
             self.logger.error(f"Filtered search failed: {str(e)}")
             self.logger.error(f"Full traceback:\n{tb_str}")
 
-            return {
-                "searchResults": [],
-                "records": [],
-                "status": Status.ERROR.value,
-                "status_code": 500,
-                "message": f"An error occurred during search: {str(e)}",
-            }
+            return self._create_empty_response("Unexpected server error during search.", Status.ERROR)
 
     async def _get_accessible_records_task(self, user_id, org_id, filter_groups, arango_service) -> List[Dict[str, Any]]:
         """Separate task for getting accessible records"""
@@ -478,23 +462,31 @@ class RetrievalService:
         """Cached vector store retrieval"""
         if not self.vector_store:
             # Check collection exists
-            collections = self.qdrant_client.get_collections()
+            collections = await self.vector_db_service.get_collections()
+            self.logger.info(f"Collections: {collections}")
             collection_info = (
-                self.qdrant_client.get_collection(self.collection_name)
-                if any(col.name == self.collection_name for col in collections.collections)
+                await self.vector_db_service.get_collection(self.collection_name)
+                if any(col.name == self.collection_name for col in collections.collections) # type: ignore
                 else None
             )
+            self.logger.info(f"Collection info: {collection_info}")
+            if not collection_info or collection_info.points_count == 0: # type: ignore
+                # Define a scoped custom error for clarity; safe to identify by class upstream
+                class VectorDBEmptyError(ValueError):
+                    pass
 
-            if not collection_info or collection_info.points_count == 0:
-                raise ValueError("Vector DB is empty or collection not found")
+                raise VectorDBEmptyError("Vector DB is empty or collection not found")
 
             # Get cached embedding model
             dense_embeddings = await self.get_embedding_model_instance()
+            self.logger.info(f"Dense embeddings: {dense_embeddings}")
             if not dense_embeddings:
                 raise ValueError("No dense embeddings found")
 
+
+
             self.vector_store = QdrantVectorStore(
-                client=self.qdrant_client,
+                client=self.vector_db_service.get_service_client(),
                 collection_name=self.collection_name,
                 vector_name="dense",
                 sparse_vector_name="sparse",
@@ -502,47 +494,66 @@ class RetrievalService:
                 sparse_embedding=self.sparse_embeddings,
                 retrieval_mode=RetrievalMode.HYBRID,
             )
-
+            self.logger.info(f"Vector store: {self.vector_store}")
         return self.vector_store
 
 
-    async def _execute_parallel_searches(self, queries, qdrant_filter, limit, vector_store) -> List[Dict[str, Any]]:
+    async def _execute_parallel_searches(self, queries, filter, limit, vector_store) -> List[Dict[str, Any]]:
         """Execute all searches in parallel"""
         all_results = []
-        seen_chunks = set()
 
-        # Process all queries in parallel
-        search_tasks = [
-            vector_store.asimilarity_search_with_score(
-                query=await self._preprocess_query(query),
-                k=limit,
-                filter=qdrant_filter
-            )
-            for query in queries
-        ]
+        dense_embeddings = await self.get_embedding_model_instance()
+        if not dense_embeddings:
+                raise ValueError("No dense embeddings found")
 
-        start_time = time.monotonic()
-        search_results = await asyncio.gather(*search_tasks)
-        elapsed = time.monotonic() - start_time
-        self.logger.debug(f"VectorDB lookup for {len(queries)} queries took {elapsed:.3f} seconds.")
-
-        # Deduplicate results
-        for results in search_results:
-            for doc, score in results:
-                if doc.page_content not in seen_chunks:
+        query_embeddings = [await dense_embeddings.aembed_query(query) for query in queries]
+        query_requests = [models.QueryRequest(
+            query=query_embedding,
+            with_payload=True,
+            limit=limit,
+            using="dense"
+        ) for query_embedding in query_embeddings]
+        search_results = self.vector_db_service.query_nearest_points(
+            collection_name=self.collection_name,
+            requests=query_requests,
+        )
+        seen_points = set()
+        for r in search_results:
+                points = r.points
+                for point in points:
+                    if point.id in seen_points:
+                        continue
+                    seen_points.add(point.id)
+                    metadata=point.payload.get("metadata", {})
+                    metadata.update({"point_id": point.id})
+                    doc = Document(
+                        page_content=point.payload.get("page_content", ""),
+                        metadata=metadata
+                    )
+                    score = point.score
                     all_results.append((doc, score))
-                    seen_chunks.add(doc.page_content)
 
         return self._format_results(all_results)
 
+    def _create_empty_response(self, message: str, status: Status) -> Dict[str, Any]:
+        """Helper to create empty response with appropriate HTTP status codes"""
+        # Map status types to appropriate HTTP status codes
+        status_code_mapping = {
+            Status.SUCCESS: 200,
+            Status.ERROR: 500,
+            Status.ACCESSIBLE_RECORDS_NOT_FOUND: 404,  # Not Found - no accessible records
+            Status.VECTOR_DB_EMPTY: 503,  # Service Unavailable - vector DB is empty
+            Status.VECTOR_DB_NOT_READY: 503,  # Service Unavailable - vector DB not ready
+            Status.EMPTY_RESPONSE: 200,  # OK but no results found
+        }
 
-    def _create_empty_response(self, message: str) -> Dict[str, Any]:
-        """Helper to create empty response"""
+        status_code = status_code_mapping.get(status, 500)  # Default to 500 for unknown status
+
         return {
             "searchResults": [],
             "records": [],
-            "status": Status.ACCESSIBLE_RECORDS_NOT_FOUND.value,
-            "status_code": 200,
+            "status": status.value,
+            "status_code": status_code,
             "message": message,
         }
 
@@ -562,8 +573,6 @@ class RetrievalService:
             Dict[str, str]: Mapping of virtual_record_id -> first accessible record_id
         """
         # Create a mapping from virtualRecordId to list of record IDs
-        # self.logger.info(f"Accessible records: {accessible_records}")
-        # self.logger.info(f"Virtual record IDs: {virtual_record_ids}")
         virtual_to_records = {}
         for record in accessible_records:
             if record and isinstance(record, dict):
@@ -575,7 +584,6 @@ class RetrievalService:
                         virtual_to_records[virtual_id] = []
                     virtual_to_records[virtual_id].append(record_id)
 
-        # self.logger.info(f"Virtual to records: {virtual_to_records}")
 
         # Create the final mapping using only the virtual record IDs from search results
         # Use the first record ID for each virtual record ID

@@ -128,18 +128,95 @@ class ConfigurationService:
         """Start watching etcd changes in a background thread"""
 
         def watch_etcd() -> None:
-            # Check if the store has a client attribute (for ETCD stores)
+            # Expect store implementations to expose .client directly
             if hasattr(self.store, 'client'):
-                while self.store.client is None:
+                # Wait for client to be ready
+                while getattr(self.store, 'client', None) is None:
                     self.logger.debug("🔄 Waiting for ETCD client to be initialized...")
                     time.sleep(3)
-                self.store.client.add_watch_prefix_callback("/", self._watch_callback)
+                try:
+                    self.store.client.add_watch_prefix_callback("/", self._watch_callback)
+                    self.logger.debug("👀 ETCD prefix watch registered for cache invalidation")
+                except Exception as e:
+                    self.logger.error("❌ Failed to register ETCD watch: %s", str(e))
             else:
-                # For in-memory stores, we don't need to watch for external changes
-                self.logger.debug("📋 Store doesn't have client attribute, skipping watch setup")
+                self.logger.debug("📋 Store doesn't expose an ETCD client; skipping watch setup")
 
         self.watch_thread = threading.Thread(target=watch_etcd, daemon=True)
         self.watch_thread.start()
+
+    async def set_config(self, key: str, value: Union[str, int, float, bool, dict, list]) -> bool:
+        """Set configuration value with optional encryption"""
+        try:
+
+            # Store in etcd
+            try:
+                await self.store.create_key(key, value, overwrite=True)
+                success = True
+            except Exception as store_error:
+                self.logger.error("❌ Failed to create key in store: %s", str(store_error))
+                success = False
+
+            if success:
+                # Update cache with value
+                self.cache[key] = value
+                self.logger.debug("✅ Successfully set config for key: %s", key)
+            else:
+                self.logger.error("❌ Failed to set config for key: %s", key)
+
+            return success
+
+        except Exception as e:
+            self.logger.error("❌ Failed to set config %s: %s", key, str(e))
+            return False
+
+    async def update_config(self, key: str, value: Union[str, int, float, bool, dict, list]) -> bool:
+        """Update configuration value with optional encryption"""
+        try:
+            # Check if key exists
+            existing_value = await self.store.get_key(key)
+            if existing_value is None:
+                self.logger.warning("⚠️ Key %s does not exist, creating new key", key)
+                return await self.set_config(key, value)
+
+            # Update in etcd
+            try:
+                await self.store.update_value(key, value)
+                success = True
+            except Exception as store_error:
+                self.logger.error("❌ Failed to update key in store: %s", str(store_error))
+                success = False
+
+            if success:
+                # Update cache with value
+                self.cache[key] = value
+                self.logger.debug("✅ Successfully updated config for key: %s", key)
+            else:
+                self.logger.error("❌ Failed to update config for key: %s", key)
+
+            return success
+
+        except Exception as e:
+            self.logger.error("❌ Failed to update config %s: %s", key, str(e))
+            return False
+
+    async def delete_config(self, key: str) -> bool:
+        """Delete configuration value"""
+        try:
+            success = await self.store.delete_key(key)
+
+            if success:
+                # Remove from cache
+                self.cache.pop(key, None)
+                self.logger.debug("✅ Successfully deleted config for key: %s", key)
+            else:
+                self.logger.error("❌ Failed to delete config for key: %s", key)
+
+            return success
+
+        except Exception as e:
+            self.logger.error("❌ Failed to delete config %s: %s", key, str(e))
+            return False
 
     def _watch_callback(self, event) -> None:
         """Handle etcd watch events to update cache"""
